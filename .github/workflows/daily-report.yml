@@ -1,0 +1,120 @@
+name: 每日评分报告
+
+on:
+  schedule:
+    # 北京时间每天16:00（收盘后），UTC 08:00
+    - cron: '0 8 * * 1-5'
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  run-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install numpy
+
+      - name: Run scoring engine
+        run: python3 unified_scoring_engine.py
+        continue-on-error: true
+
+      - name: Get date
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Send email with report
+        if: always()
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          python3 -c "
+          import os, smtplib, glob
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+          from email.mime.base import MIMEBase
+          from email import encoders
+          from datetime import datetime
+
+          date_str = datetime.now().strftime('%Y-%m-%d')
+          host = os.environ.get('SMTP_HOST', '')
+          port = int(os.environ.get('SMTP_PORT', '465'))
+          user = os.environ.get('SMTP_USER', '')
+          passwd = os.environ.get('SMTP_PASS', '')
+          to = os.environ.get('EMAIL_TO', '')
+
+          if not all([host, user, passwd, to]):
+              print('Email config missing, skipping. Set SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/EMAIL_TO in repo Secrets.')
+              exit(0)
+
+          # Find report
+          html_files = sorted(glob.glob(f'output/unified_*.html'))
+          if not html_files:
+              print('No report generated.')
+              exit(0)
+
+          html_file = html_files[-1]
+          with open(html_file, 'r', encoding='utf-8') as f:
+              html_content = f.read()
+
+          msg = MIMEMultipart('alternative')
+          msg['From'] = user
+          msg['To'] = to
+          msg['Subject'] = f'统一评分决策日报 {date_str}'
+
+          # HTML body (truncated for email clients)
+          if len(html_content) > 500000:
+              html_content = html_content[:500000] + '\n\n[报告内容过长，完整版见附件]'
+
+          msg.attach(MIMEText(html_content, 'html', 'utf-8'))
+
+          # Attach full HTML as file
+          with open(html_file, 'rb') as f:
+              part = MIMEBase('application', 'octet-stream')
+              part.set_payload(f.read())
+              encoders.encode_base64(part)
+              part.add_header('Content-Disposition', f'attachment; filename=unified_{date_str}.html')
+              msg.attach(part)
+
+          # Attach JSON
+          json_files = sorted(glob.glob(f'output/unified_*.json'))
+          if json_files:
+              with open(json_files[-1], 'rb') as f:
+                  part = MIMEBase('application', 'octet-stream')
+                  part.set_payload(f.read())
+                  encoders.encode_base64(part)
+                  part.add_header('Content-Disposition', f'attachment; filename=unified_{date_str}.json')
+                  msg.attach(part)
+
+          try:
+              if port == 465:
+                  server = smtplib.SMTP_SSL(host, port, timeout=30)
+              else:
+                  server = smtplib.SMTP(host, port, timeout=30)
+                  server.starttls()
+              server.login(user, passwd)
+              server.sendmail(user, to.split(','), msg.as_string())
+              server.quit()
+              print(f'Email sent to {to}')
+          except Exception as e:
+              print(f'Email failed: {e}')
+          "
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ steps.date.outputs.date }}
+          path: output/unified_*.html
+          retention-days: 30
