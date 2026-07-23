@@ -267,7 +267,8 @@ def run_strategy_backtest(klines, extra_today, sectors, backtest_days=85):
             "cumulative_return": cum_ret,
             "avg_hold_days": avg_hold,
             "reason_stats": dict(reason_stats),
-            "closed_trades": closed_trades[-50:],  # 最近50笔
+            "closed_trades": closed_trades[-50:],
+            "closed_trades_all": closed_trades,  # 全部交易用于胜率统计
             "signals": signals[-500:],
         }
         
@@ -333,11 +334,12 @@ def run_strategy_backtest(klines, extra_today, sectors, backtest_days=85):
     trades_out = {}
     for strat in STRATEGIES:
         r = strategy_results[strat]
+        all_wins = sum(1 for t in r["closed_trades_all"] if t["return_pct"] > 0)
         trades_out[strat] = {
             "open": [],
             "closed": r["closed_trades"],
             "cumulative_return": r["cumulative_return"],
-            "win_count": sum(1 for t in r["closed_trades"] if t["return_pct"] > 0),
+            "win_count": all_wins,
             "total_count": r["total_trades"],
         }
     

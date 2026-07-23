@@ -65,7 +65,7 @@ class StockDB:
     def __init__(self, db_path=None):
         self.db_path = db_path or _get_db_path()
         self._init_db()
-        self._node_script = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/resources/builtin-skills/westock-data/scripts/index.js"
+        self._node_script = None  # 已改用纯Python实现，不再依赖Node.js
         self._workers = 20
 
     def _connect(self):
@@ -80,7 +80,9 @@ class StockDB:
 
     @staticmethod
     def _to_symbol(code):
-        return f"sh{code}" if code.startswith(("6","9")) else f"sz{code}"
+        if code.startswith(("8", "4", "920")):
+            return f"bj{code}"
+        return f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}"
 
     def get_klines(self, codes, days=130):
         today = datetime.now().strftime("%Y-%m-%d")
@@ -142,12 +144,18 @@ class StockDB:
                 completed += 1
                 if completed % 30 == 0: print(f"  K线: {completed}/{len(codes)}")
                 if kls:
-                    parsed = [{"date":k[0],"open":float(k[1]),"close":float(k[2]),"high":float(k[3]),"low":float(k[4]),"volume":float(k[5]) if len(k)>5 else 0} for k in kls]
-                    existing = {r["date"]:r for r in all_klines.get(code,[])}
-                    for r in parsed: existing[r["date"]] = r
-                    all_klines[code] = sorted(existing.values(), key=lambda x:x["date"])
-                    self._save_klines(code, parsed)
-                    self._log_fetch(code, today, "klines", "ok")
+                    parsed = []
+                    for k in kls:
+                        try:
+                            parsed.append({"date":k[0],"open":float(k[1]),"close":float(k[2]),"high":float(k[3]),"low":float(k[4]),"volume":float(k[5]) if len(k)>5 else 0})
+                        except (IndexError, ValueError, TypeError):
+                            continue
+                    if parsed:
+                        existing = {r["date"]:r for r in all_klines.get(code,[])}
+                        for r in parsed: existing[r["date"]] = r
+                        all_klines[code] = sorted(existing.values(), key=lambda x:x["date"])
+                        self._save_klines(code, parsed)
+                        self._log_fetch(code, today, "klines", "ok")
                 else:
                     self._log_fetch(code, today, "klines", "failed", err)
 
@@ -228,34 +236,72 @@ class StockDB:
         return result
 
     def _fetch_fund_flows_batch(self, codes, today):
+        """纯Python实现资金流数据获取，不依赖Node.js"""
         result = {}
         for i in range(0, len(codes), 30):
             batch = codes[i:i+30]
-            symbols = ",".join(self._to_symbol(c) for c in batch)
-            cmd = ["node", self._node_script, "fund", "flow", symbols, "--raw"]
-            try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-                if res.returncode != 0: continue
-                data = json.loads(res.stdout)
-                if not isinstance(data, list): continue
-                for item in data:
-                    sym = item.get("symbol","")
-                    if len(sym) < 6: continue
-                    code = sym[2:]
+            for code in batch:
+                try:
+                    sym = self._to_symbol(code)
+                    # 东方财富资金流API
+                    # 0=主力净流入, 1=小单, 2=中单, 3=大单
+                    mkt = f"{sym[:2]}"  # sh/sz/bj
+                    secid = self._get_eastmoney_secid(code)
+                    if not secid: continue
+                    url = f"https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?secid={secid}&lmt=0&klt=101&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56,f57&ut=b2884a393a59ad64002292a3e90d46a5"
+                    req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0","Referer":"https://data.eastmoney.com"})
+                    resp = urllib.request.urlopen(req, timeout=10)
+                    data = json.loads(resp.read().decode("utf-8"))
+                    klines = data.get("data",{}).get("klines",[])
+                    if not klines: continue
+                    # 最近5天和20天主力净流入
+                    recent = klines[-20:] if len(klines) >= 20 else klines
+                    main_flows = []
+                    for line in recent:
+                        parts = line.split(",")
+                        if len(parts) >= 6:
+                            main_flows.append(float(parts[1]))  # 主力净流入(元)
+                    main_net_5d = sum(main_flows[-5:]) if len(main_flows) >= 5 else sum(main_flows)
+                    main_net_20d = sum(main_flows)
+                    main_net_today = main_flows[-1] if main_flows else 0
+                    # 估算主力流入占比 = 今日主力净流入 / 流通市值
+                    today_info = {}
                     try:
-                        info = {"main_net_5d":float(item.get("MainNetFlow5D",0)),
-                                "main_net_20d":float(item.get("MainNetFlow20D",0)),
-                                "inflow_rate":float(item.get("MainInflowCircRate",0)),
-                                "jumbo_net":float(item.get("JumboNetFlow",0)),
-                                "main_net_today":float(item.get("MainNetFlow",0))}
-                    except (ValueError, TypeError): continue
+                        ex_url = f"https://qt.gtimg.cn/q={self._to_symbol(code)}"
+                        ex_req = urllib.request.Request(ex_url, headers={"User-Agent":"Mozilla/5.0"})
+                        ex_resp = urllib.request.urlopen(ex_req, timeout=5)
+                        ex_data = ex_resp.read().decode("gbk", errors="replace")
+                        ex_vals = ex_data.split('"')[1].split("~") if '"' in ex_data else []
+                        if len(ex_vals) > 44:
+                            circ_mcap = float(ex_vals[44]) * 1e8 if ex_vals[44] else 0  # 流通市值(亿→元)
+                            inflow_rate = (main_net_today / circ_mcap * 100) if circ_mcap > 0 else 0
+                        else:
+                            inflow_rate = 0
+                    except Exception:
+                        inflow_rate = 0
+                    info = {
+                        "main_net_5d": main_net_5d,
+                        "main_net_20d": main_net_20d,
+                        "inflow_rate": inflow_rate,
+                        "jumbo_net": 0,
+                        "main_net_today": main_net_today,
+                    }
                     result[code] = info
                     self._save_fund(code, today, info)
                     self._log_fetch(code, today, "fund_flow", "ok")
-            except Exception as e:
-                for c in batch:
-                    self._log_fetch(c, today, "fund_flow", "failed", str(e)[:200])
+                except Exception as e:
+                    self._log_fetch(code, today, "fund_flow", "failed", str(e)[:200])
         return result
+
+    @staticmethod
+    def _get_eastmoney_secid(code):
+        """获取东方财富secid格式: 1.600000 / 0.000001 / 0.300001"""
+        if code.startswith(("6", "9")):
+            return f"1.{code}"
+        elif code.startswith(("8", "4", "920")):
+            return f"0.{code}"  # 北交所
+        else:
+            return f"0.{code}"
 
     def _save_fund(self, code, date, info):
         with self._connect() as conn:

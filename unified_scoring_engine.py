@@ -66,7 +66,7 @@ ICIR_GLM["pct_52w"] = -0.091
 FACTOR_HIGHER_BETTER = {
     "turnover_z": True, "log_mcap": True, "mfi": True, "pct_52w": True,
     "pe_percentile": False, "pb_percentile": False, "gap_open": True,
-    "max_dd_20d": False, "ma_trend": True, "rsi_signal": True,
+    "max_dd_20d": True, "ma_trend": True, "rsi_signal": True,
     "macd_signal": True, "cmf": True, "vol_price": True,
     "vol_ratio_5d": True, "ret_5d": True, "ret_20d": True,
     "dev_ma20": True, "streak": True, "vol_up_days": True,
@@ -116,15 +116,24 @@ def calc_rsi(closes, period=14):
     return 100 - 100 / (1 + gains / losses)
 
 def calc_macd(closes, fast=12, slow=26, signal=9):
-    if len(closes) < slow: return 0,0,0
-    ef = calc_ema(closes,fast); es = calc_ema(closes,slow)
-    dif = ef - es
-    macds = []
-    for i in range(slow, len(closes)+1):
-        c = closes[:i]; ef2 = calc_ema(c,fast); es2 = calc_ema(c,slow)
-        macds.append(ef2-es2)
-    dea = calc_ema(macds,signal) if len(macds)>=signal else dif
-    return dif, dea, 2*(dif-dea)
+    if len(closes) < slow:
+        return 0, 0, 0
+    # 增量EMA计算，避免重复遍历
+    kf = 2 / (fast + 1); ks = 2 / (slow + 1); kd = 2 / (signal + 1)
+    ema_fast = closes[0]; ema_slow = closes[0]
+    difs = []
+    for i in range(1, len(closes)):
+        ema_fast = closes[i] * kf + ema_fast * (1 - kf)
+        if i >= slow - 1:
+            ema_slow = closes[i] * ks + ema_slow * (1 - ks)
+            difs.append(ema_fast - ema_slow)
+    if not difs:
+        return 0, 0, 0
+    dif = difs[-1]
+    dea = difs[0]
+    for d in difs[1:]:
+        dea = d * kd + dea * (1 - kd)
+    return dif, dea, 2 * (dif - dea)
 
 def calc_cmf(highs,lows,closes,volumes,period=20):
     if len(closes) < period: return 0
@@ -162,6 +171,26 @@ def compute_all_factors(klines, extra_info, fund_flows, events, sectors):
     factor_data = {}
     return_data = {}  # 5d/10d/20d returns
 
+    # 预计算每个板块的聚合指标(避免O(K^2)重复计算)
+    sector_aggs = {}
+    for sector_name in set(sectors.values()):
+        s_codes = [c for c in all_codes if sectors.get(c) == sector_name and c in klines and len(klines[c]) >= 15]
+        if not s_codes: continue
+        s_rsis = []; s_moms = []
+        for sc in s_codes:
+            sc_c = [b["close"] for b in klines[sc][-15:]]
+            if len(sc_c) >= 15:
+                sg = sum(max(sc_c[i]-sc_c[i-1],0) for i in range(1,15))
+                sl = sum(max(sc_c[i-1]-sc_c[i],0) for i in range(1,15))
+                s_rsis.append(100 if sl==0 and sg>0 else (50 if sl==0 else 100-100/(1+sg/sl)))
+            sc_c6 = [b["close"] for b in klines[sc][-6:]]
+            if len(sc_c6) >= 6 and sc_c6[0] > 0:
+                s_moms.append((sc_c6[-1]/sc_c6[0]-1)*100)
+        sector_aggs[sector_name] = {
+            "rsi": (sum(s_rsis)/len(s_rsis) - 50) if s_rsis else 0,
+            "momentum": sum(s_moms)/len(s_moms) if s_moms else 0,
+        }
+
     for code in all_codes:
         k = klines.get(code, [])
         if len(k) < 60: continue
@@ -175,9 +204,9 @@ def compute_all_factors(klines, extra_info, fund_flows, events, sectors):
         extra = extra_info.get(code, {})
 
         # 多周期涨跌
-        ret_5d = (closes[-1]/closes[-6]-1)*100 if len(closes)>=6 else 0
-        ret_10d = (closes[-1]/closes[-11]-1)*100 if len(closes)>=11 else 0
-        ret_20d_pct = (closes[-1]/closes[-21]-1)*100 if len(closes)>=21 else 0
+        ret_5d = (closes[-1]/closes[-6]-1)*100 if len(closes)>=6 and closes[-6]>0 else 0
+        ret_10d = (closes[-1]/closes[-11]-1)*100 if len(closes)>=11 and closes[-11]>0 else 0
+        ret_20d_pct = (closes[-1]/closes[-21]-1)*100 if len(closes)>=21 and closes[-21]>0 else 0
         return_data[code] = {"ret_5d":ret_5d,"ret_10d":ret_10d,"ret_20d":ret_20d_pct}
 
         ma5,ma10,ma20 = calc_ma(closes,5), calc_ma(closes,10), calc_ma(closes,20)
@@ -202,11 +231,12 @@ def compute_all_factors(klines, extra_info, fund_flows, events, sectors):
         for i in range(len(closes)-1,0,-1):
             if closes[i]>closes[i-1]: streak+=1
             else: break
-        # 计算连跌天数
+        streak = min(streak, 10)
         streak_dn = 0
         for i in range(len(closes)-1,0,-1):
             if closes[i]<closes[i-1]: streak_dn+=1
             else: break
+        streak_dn = min(streak_dn, 10)
 
         gap_open = (opens[-1]/closes[-2]-1)*100 if len(closes)>=2 and closes[-2] else 0
         turnover_z = extra.get("turnover",0) or 0
@@ -226,19 +256,16 @@ def compute_all_factors(klines, extra_info, fund_flows, events, sectors):
 
         pe = extra.get("pe_ttm",0) or 0; pb = extra.get("pb",0) or 0
         mcap = extra.get("mcap",0) or 0
-        pe_percentile = 100-pct_52w; pb_percentile = 100-pct_52w
+        # PE/PB分位: 用真实PE/PB，低值更好
+        pe_percentile = pe if pe > 0 else 50  # 无PE时给中性值50
+        pb_percentile = pb if pb > 0 else 50
         log_mcap = math.log(max(mcap,1e8))
 
         sector = sectors.get(code,"其他")
-        sector_rsi = rsi_val-50
-        sector_stocks = [c for c,s in sectors.items() if s==sector and c in klines and len(klines[c])>=6]
-        sector_momentum = 0
-        if sector_stocks:
-            s_rets = []
-            for sc in sector_stocks:
-                sc_c = [b["close"] for b in klines[sc][-6:]]
-                if len(sc_c)>=6: s_rets.append((sc_c[-1]/sc_c[0]-1)*100)
-            if s_rets: sector_momentum = sum(s_rets)/len(s_rets)
+        # 从预计算的板块聚合数据中取值
+        sector_agg = sector_aggs.get(sector, {})
+        sector_rsi = sector_agg.get("rsi", 0)
+        sector_momentum = sector_agg.get("momentum", 0)
 
         evts = events.get(code,[])
         event_score = sum(e.get("base_score",0) for e in evts if e.get("base_score"))
@@ -277,9 +304,10 @@ def compute_all_factors(klines, extra_info, fund_flows, events, sectors):
     for fname in factor_names:
         values = [factor_data[c].get(fname,0) for c in factor_data]
         arr = np.array(values,dtype=float)
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)  # 防止NaN传播
         arr = np.clip(arr,np.percentile(arr,1),np.percentile(arr,99))
         mean,std = np.mean(arr),np.std(arr)
-        if std == 0: continue
+        if std == 0 or np.isnan(std) or std < 1e-10: continue
         z = (arr-mean)/std
         if not FACTOR_HIGHER_BETTER.get(fname,True): z = -z
         for ci,code in enumerate(factor_data.keys()):
@@ -301,7 +329,7 @@ def compute_rankings(factor_data):
 
         # SS评分 — 完全对齐 scoring_engine_icir.py 源码算法
         # 技术面: 基分50, 离散加分/减分
-        rsi_val = factors.get("rsi_signal",0)*15+50  # 反推原始RSI值
+        rsi_val = factors.get("_rsi",50)  # 直接用存储的原始RSI值
         tech_delta = 0
         # MA多头排列: MA5>MA10>MA20
         ma5_v = factors.get("_ma5",0); ma10_v = factors.get("_ma10",0); ma20_v = factors.get("_ma20",0)
@@ -310,10 +338,10 @@ def compute_rankings(factor_data):
         # MACD: DIF>0 且 DIF>DEA
         dif = factors.get("_dif",0); dea = factors.get("_dea",0)
         if dif > 0 and dif > dea: tech_delta += 5
-        # RSI
-        if 40 <= rsi_val <= 55: tech_delta -= 3
-        elif rsi_val > 80: tech_delta += 12
-        elif rsi_val > 75: tech_delta += 10
+        # RSI (A股阈值调整: 40-60中性, >85超买危险, <30超卖机会)
+        if rsi_val > 85: tech_delta -= 5   # 超买回调风险
+        elif rsi_val < 30: tech_delta += 8  # 超卖反弹机会
+        elif rsi_val < 40: tech_delta -= 3  # 偏弱
         tech_score = max(5, min(95, 50 + tech_delta))
 
         # 资金面: 基分50, CMF加减分
@@ -322,6 +350,7 @@ def compute_rankings(factor_data):
         if cmf_raw > 0.1: cap_delta += 8
         elif cmf_raw > 0: cap_delta += 3
         elif cmf_raw < -0.1: cap_delta -= 8
+        elif cmf_raw < 0: cap_delta -= 3  # 对称: 微流出也扣分
         capital_score = max(5, min(95, 50 + cap_delta))
 
         # 信息面: 固定50
@@ -382,7 +411,10 @@ def compute_rankings(factor_data):
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE) as f: return json.load(f)
+        try:
+            with open(HISTORY_FILE) as f: return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            print(f"  [WARN] 历史文件损坏，重置")
     return {}
 
 def save_history(rankings, extra_info, date_str):
@@ -420,14 +452,20 @@ def get_ss_trend(code, history):
 
 def load_trades():
     if os.path.exists(TRADE_FILE):
-        with open(TRADE_FILE) as f: return json.load(f)
+        try:
+            with open(TRADE_FILE) as f: return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            print(f"  [WARN] 交易账本损坏，重置")
     return {"isir":{"open":[],"closed":[],"cumulative_return":0,"win_count":0,"total_count":0},
             "glm":{"open":[],"closed":[],"cumulative_return":0,"win_count":0,"total_count":0},
             "doubao":{"open":[],"closed":[],"cumulative_return":0,"win_count":0,"total_count":0}}
 
 def load_signals():
     if os.path.exists(SIGNAL_FILE):
-        with open(SIGNAL_FILE) as f: return json.load(f)
+        try:
+            with open(SIGNAL_FILE) as f: return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            print(f"  [WARN] 信号历史损坏，重置")
     return []
 
 def update_trades(rankings, extra_info, date_str):
@@ -464,8 +502,10 @@ def update_trades(rankings, extra_info, date_str):
                 exit_reason = f"排名崩溃(#{current_rank})"
 
             if exit_reason:
+                # 信号日收盘触发，记录信号价；实际成交价在次日确认
                 trade["exit_date"] = date_str
-                trade["exit_price"] = price
+                trade["exit_price"] = price  # 信号价(收盘)
+                trade["signal_price"] = price
                 trade["return_pct"] = current_ret
                 trade["is_win"] = current_ret > 0
                 trade["status"] = "closed"
@@ -490,12 +530,13 @@ def update_trades(rankings, extra_info, date_str):
                 still_open.append(trade)
                 today_signals[strategy][code] = "watch"
 
-        # New entries → 买入信号（仅在有空位时买入）
+        # New entries → 买入信号（仅在有空位时买入，排除今日卖出的股票避免反复买卖）
         existing_codes = {t["code"] for t in still_open}
+        sold_today = {s["code"] for s in signals if s.get("strategy")==strategy and s.get("signal")=="sell" and s.get("date")==date_str}
         available_slots = MAX_POSITIONS - len(still_open)
         if available_slots > 0:
             new_candidates = sorted(
-                [(code, current_top_info[code][rank_key]) for code in current_top - existing_codes],
+                [(code, current_top_info[code][rank_key]) for code in current_top - existing_codes - sold_today],
                 key=lambda x: x[1]
             )
             for code, rank in new_candidates[:available_slots]:
@@ -549,11 +590,12 @@ def compute_market_overview(klines, extra_info, rankings):
         total_valid += 1
         if closes[-1] > ma20:
             above_ma20 += 1
-        # 5日新高/新低
-        if closes[-1] >= max(highs := [bar["high"] for bar in k[-5:]]) if len(k)>=5 else closes[-1]:
-            new_high_5d += 1
-        if closes[-1] <= min(lows := [bar["low"] for bar in k[-5:]]) if len(k)>=5 else closes[-1]:
-            new_low_5d += 1
+        # 5日新高/新低（排除今日，对比前4日）
+        if len(k) >= 5:
+            if closes[-1] >= max(bar["high"] for bar in k[-5:-1]):
+                new_high_5d += 1
+            if closes[-1] <= min(bar["low"] for bar in k[-5:-1]):
+                new_low_5d += 1
 
     if total_valid > 0:
         bread_pct = round(above_ma20 / total_valid * 100, 1)
@@ -684,23 +726,38 @@ def run_backtest(klines, extra_info, sectors, backtest_days=180):
                 continue
 
             # 用历史K线推算extra_info，避免前视偏差
+            # 预计算每只股票的股本(从今日市值/今日收盘价反推)
+            shares_cache = {}
+            for code in day_klines:
+                today_info = extra_info.get(code, {})
+                tp = today_info.get("price", 0)
+                tm = today_info.get("mcap", 0)
+                if tp > 0 and tm > 0:
+                    shares_cache[code] = tm / tp  # 股本(股)
+                else:
+                    shares_cache[code] = 0
+
             day_extra = {}
             for code in day_klines:
                 k_bars = day_klines.get(code, [])
                 if k_bars and len(k_bars) >= 2:
                     last = k_bars[-1]; prev = k_bars[-2]
-                    # vol_ratio 从K线计算: 今日量 / 5日均量
                     avg_vol_5 = sum(b["volume"] for b in k_bars[-6:-1]) / 5 if len(k_bars) >= 6 else last["volume"]
                     vr = last["volume"] / avg_vol_5 if avg_vol_5 > 0 else 1.0
+                    # 用股本反推历史市值和换手率
+                    shares = shares_cache.get(code, 0)
+                    hist_mcap = last["close"] * shares if shares > 0 else 0
+                    hist_turnover = (last["volume"] / shares * 100) if shares > 0 else 0
+                    today_info = extra_info.get(code, {})
                     day_extra[code] = {
-                        "name": extra_info.get(code,{}).get("name",code),  # 名称不随时间变
+                        "name": today_info.get("name", code),
                         "price": last["close"],
                         "change_pct": (last["close"]/prev["close"]-1)*100,
-                        "pe_ttm": 0,      # 无历史PE，置0（pe_percentile用pct_52w兜底）
-                        "pb": 0,           # 同上
-                        "mcap": 0,         # 无历史市值，log_mcap用默认值
-                        "turnover": 0,     # 无历史换手率
-                        "vol_ratio": vr,   # 从K线推算
+                        "pe_ttm": today_info.get("pe_ttm", 0) or 0,  # 用今日PE近似(有偏差但优于0)
+                        "pb": today_info.get("pb", 0) or 0,
+                        "mcap": hist_mcap,           # 从股本反推
+                        "turnover": hist_turnover,   # 从股本反推
+                        "vol_ratio": vr,
                     }
 
             factor_data, _ = compute_all_factors(day_klines, day_extra, {}, {}, sectors)
@@ -755,7 +812,7 @@ def run_backtest(klines, extra_info, sectors, backtest_days=180):
         min_r20 = np.min(r20)
 
         # 综合评分：胜率权重0.6 + 平均收益权重0.4
-        composite = win20 * 0.6 + max(0, avg20) * 2
+        composite = win20 * 0.5 + avg20 * 3  # 不截断负值，让亏损策略区分开
 
         summary[strat] = {
             "total_trades": len(results[strat]["trades"]),
@@ -1314,7 +1371,6 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 .sector-bar-name{{min-width:70px;font-weight:500}}
 .sector-bar-val{{font-weight:600;min-width:50px}}
 @media(max-width:768px){{.dashboard{{grid-template-columns:repeat(3,1fr)}}.detail-grid{{grid-template-columns:1fr}}.mo-grid{{grid-template-columns:repeat(2,1fr)}}}}
-@media(max-width:768px){{.dashboard{{grid-template-columns:repeat(3,1fr)}}.detail-grid{{grid-template-columns:1fr}}}}
 </style></head><body><div class="container">
 <div class="header"><h1>统一评分决策日报 v2.0</h1><div class="meta">日期:{date_str} | 股票池:{n_total}只 | K线:{freshness.get('kline_latest','-')} | 行情:{freshness.get('extra_latest','-')}</div></div>
 
@@ -1382,7 +1438,7 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 <script>
 function switchTab(n){{document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');[...document.querySelectorAll('.tab-btn')].find(b=>b.textContent.includes(n=='overview'?'纵览':n=='sector'?'板块':n.toUpperCase())||b.onclick.toString().includes("'"+n+"'"))?.classList.add('active')}}
 function toggleRow(id){{var r=document.getElementById(id);if(r)r.style.display=r.style.display==='none'?'table-row':'none'}}
-function filterPanel(name){{var s=document.getElementById('sector-'+name)?.value;var c=document.getElementById('consensus-'+name)?.checked;var q=(document.getElementById('search-'+name)?.value||'').toLowerCase();var rows=document.querySelectorAll('#body-'+name+' tr');rows.forEach(function(row){{var cells=row.getElementsByTagName('td');if(cells.length<10)return;var code=cells[0].textContent.trim();var nm=cells[1].textContent.trim();var sec=(cells[1].textContent.match(/[\\u4e00-\\u9fff\\/]+/)||[''])[0];var badge=cells[12].textContent.trim();var show=true;if(s&&s!=='all'&&!cells[1].textContent.includes(s))show=false;if(c&&!badge.includes('共识'))show=false;if(q&&!code.toLowerCase().includes(q)&&!nm.toLowerCase().includes(q))show=false;row.style.display=show?'':'none'}})}}
+function filterPanel(name){{var s=document.getElementById('sector-'+name)?.value;var c=document.getElementById('consensus-'+name)?.checked;var q=(document.getElementById('search-'+name)?.value||'').toLowerCase();var rows=document.querySelectorAll('#body-'+name+' tr');rows.forEach(function(row){{if(row.classList.contains('detail-row'))return;var cells=row.getElementsByTagName('td');if(cells.length<12)return;var code=cells[0].textContent.trim();var nm=cells[1].textContent.trim();var badge=cells[11].textContent.trim();var show=true;if(s&&s!=='all'&&!cells[1].textContent.includes(s))show=false;if(c&&!badge.includes('共识'))show=false;if(q&&!code.toLowerCase().includes(q)&&!nm.toLowerCase().includes(q))show=false;row.style.display=show?'':'none';var next=row.nextElementSibling;if(next&&next.classList.contains('detail-row'))next.style.display=show?(next.style.display):'none'}})}}
 function toggleSector(s){{var b=document.getElementById('sec-'+s)?.querySelector('.sector-body');if(b)b.style.display=b.style.display==='none'?'block':'none'}}
 </script></body></html>"""
     return html
