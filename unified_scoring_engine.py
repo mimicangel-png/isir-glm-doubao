@@ -326,6 +326,7 @@ def fetch_global_markets():
         "^NDX": ("纳斯达克100", "科技板块情绪"),
         "^DJI": ("道琼斯", "整体风险偏好"),
         "^VIX": ("VIX恐慌指数", "市场恐慌度"),
+        "^N225": ("日经225", "亚太早盘风向"),
     }
     for symbol, (name, impact) in sources.items():
         try:

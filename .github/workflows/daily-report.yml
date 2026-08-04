@@ -2,8 +2,9 @@ name: 每日盘前评分报告
 
 on:
   schedule:
-    # 北京时间每天9:00（UTC 1:00），仅工作日
+    # 北京时间每天9:00（盘前, 美股隔夜数据）和12:00（午盘, 日韩数据补充）
     - cron: '0 1 * * 1-5'
+    - cron: '0 4 * * 1-5'
   workflow_dispatch:  # 支持手动触发
 
 jobs:
@@ -80,7 +81,7 @@ jobs:
           msg = MIMEMultipart('alternative')
           msg['From'] = user
           msg['To'] = to
-          msg['Subject'] = f'统一评分盘前日报 {date_str}'
+          msg['Subject'] = f'统一评分日报 {date_str}（{"盘前" if datetime.now().hour < 11 else "午盘"}更新）'
 
           # HTML body（截断到安全的闭合点）
           if len(html_content) > 300000:
