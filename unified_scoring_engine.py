@@ -46,22 +46,48 @@ MAX_POSITIONS = 30      # 最大持仓数
 # ICIR Weights — 精确来自 scoring_engine_icir.py / v3_vs_glm_tracker.py
 # ================================================================
 
+# ICIR v3.1 — 2026-08-04 重标定
+# 有回测数据的因子用 Spearman rank IC 做权重 (85日5日前向收益)
+# 无回测数据的因子 (IC=0) 保留原始手调权重
 ICIR_V3 = {
-    "turnover_z": 0.451, "log_mcap": 0.162, "mfi": 0.153, "pct_52w": 0.091,
-    "pe_percentile": 0.078, "pb_percentile": 0.078, "gap_open": 0.072,
-    "max_dd_20d": 0.052, "ma_bull": 0.029, "rsi_signal": 0.028,
-    "macd_signal": 0.026, "cmf": 0.025, "vol_price": 0.025,
-    "dev_ma20": 0.024, "vol_ratio_5d": 0.023, "vwap_premium": 0.022,
-    "ret_5d": 0.021, "streak": 0.020, "event_score": 0.020,
-    "event_count": 0.018, "sector_rsi": 0.015, "sector_momentum": 0.012,
-    "inflow_rate": 0.010, "main_flow_5d": 0.008, "main_flow_20d": 0.006,
-    "amplitude_z": 0.005, "ret_20d": 0.004, "volatility_20d": 0.003,
-    "roe_rank": 0.001, "gross_margin_rank": 0.001, "ocf_ratio_rank": 0.001,
+    # --- 有IC数据: 使用标定值 ---
+    "sector_rsi": 0.0956,      # IC最高, 正天数72%, 原0.015→大幅提升
+    "dev_ma20": 0.0897,        # 原0.024→提升
+    "vwap_premium": 0.0889,    # 原0.022→提升
+    "macd_signal": 0.0734,    # 原0.026→提升
+    "sector_momentum": 0.0688, # 原0.012→提升
+    "ret_20d": 0.0681,        # 原0.004→大幅提升
+    "rsi_signal": 0.0652,    # 原0.028→提升
+    "ma_bull": 0.0559,       # 原0.029→提升
+    "ret_5d": 0.0554,        # 原0.021→提升
+    "max_dd_20d": 0.042,     # 原0.052→略降
+    "mfi": 0.0399,           # 原0.153→大幅下降
+    "gap_open": 0.0328,      # 原0.072→下降
+    "vol_price": 0.0277,     # 原0.025→略升
+    "pct_52w": 0.0248,       # 原0.091→大幅下降
+    "cmf": 0.0189,           # 原0.025→略降
+    "streak": 0.0123,        # 原0.020→略降
+    "volatility_20d": 0.0079, # 原0.003→略升
+    "amplitude_z": -0.0221,   # 原0.005→方向反转! 高振幅不利
+    "vol_ratio_5d": -0.0142,  # 原0.023→方向反转! 高量比不利
+    # --- 无IC数据(回测中缺行情/资金流): 保留原始权重 ---
+    "turnover_z": 0.451,
+    "log_mcap": 0.162,
+    "pe_percentile": 0.078,
+    "pb_percentile": 0.078,
+    "event_score": 0.020,
+    "event_count": 0.018,
+    "inflow_rate": 0.010,
+    "main_flow_5d": 0.008,
+    "main_flow_20d": 0.006,
+    "roe_rank": 0.001,
+    "gross_margin_rank": 0.001,
+    "ocf_ratio_rank": 0.001,
 }
 
 ICIR_GLM = dict(ICIR_V3)
-ICIR_GLM["mfi"] = -0.153
-ICIR_GLM["pct_52w"] = -0.091
+ICIR_GLM["mfi"] = -ICIR_V3["mfi"]      # GLM 反转 mfi
+ICIR_GLM["pct_52w"] = -ICIR_V3["pct_52w"]  # GLM 反转 pct_52w
 
 FACTOR_HIGHER_BETTER = {
     "turnover_z": True, "log_mcap": True, "mfi": True, "pct_52w": True,
@@ -92,6 +118,201 @@ FACTOR_LABELS = {
     "roe_rank":"ROE排名","gross_margin_rank":"毛利率排名","ocf_ratio_rank":"经营现金流排名",
     "volatility_20d":"20日波动",
 }
+
+# ================================================================
+# Market Trend Gate — 指数 vs 50日均线, 熊市自动减仓
+# ================================================================
+
+def fetch_index_klines(days=300):
+    """从腾讯API获取上证综指K线 (指数不支持fqkline, 用kline端点)"""
+    import urllib.request
+    sym = "sh000001"
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/kline/kline?param={sym},day,,,{days},"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = json.loads(resp.read().decode("utf-8"))
+        kls = data.get("data", {}).get(sym, {}).get("day", [])
+        parsed = []
+        for k in kls:
+            try:
+                parsed.append({"date": k[0], "close": float(k[2]), "high": float(k[3]), "low": float(k[4])})
+            except (IndexError, ValueError, TypeError):
+                continue
+        return parsed
+    except Exception:
+        return []
+
+def calc_market_trend(index_klines):
+    """计算市场趋势: 指数收盘 vs 50日均线
+    返回: (trend: 1=多头/-1=空头, ma50, close, label)
+    """
+    if not index_klines or len(index_klines) < 50:
+        return 1, 0, 0, "数据不足(默认多头)"
+    closes = [b["close"] for b in index_klines]
+    ma50 = sum(closes[-50:]) / 50
+    close = closes[-1]
+    if close > ma50:
+        pct = (close / ma50 - 1) * 100
+        return 1, round(ma50, 1), round(close, 1), f"多头(指数{pct:+.1f}%>MA50)"
+    else:
+        pct = (close / ma50 - 1) * 100
+        return -1, round(ma50, 1), round(close, 1), f"空头(指数{pct:+.1f}%<MA50)"
+
+# ================================================================
+# VCP (波动收缩形态) 检测 — Minervini
+# ================================================================
+
+VCP_SWING_WINDOW = 3
+VCP_CONTRACTION_RATIO = 0.85
+VCP_T1_MIN = 0.03
+VCP_T1_MAX = 0.50
+VCP_MIN_CONTRACTIONS = 2
+VCP_LOOKBACK = 200
+
+def _find_swings(highs, lows, window=3):
+    """识别 Swing High 和 Swing Low"""
+    n = len(highs)
+    swings = []
+    for i in range(window, n - window):
+        is_high = all(highs[i] >= highs[i + j] for j in range(-window, window + 1) if j != 0)
+        if is_high:
+            swings.append((i, "H", highs[i]))
+        is_low = all(lows[i] <= lows[i + j] for j in range(-window, window + 1) if j != 0)
+        if is_low:
+            swings.append((i, "L", lows[i]))
+    swings.sort(key=lambda x: x[0])
+    merged = []
+    for s in swings:
+        if merged and merged[-1][1] == s[1] and s[0] - merged[-1][0] <= window:
+            if s[1] == "H":
+                merged[-1] = (merged[-1][0], "H", max(merged[-1][2], s[2]))
+            else:
+                merged[-1] = (merged[-1][0], "L", min(merged[-1][2], s[2]))
+        else:
+            merged.append(list(s))
+    return [(s[0], s[1], s[2]) for s in merged]
+
+def _detect_vcp_pattern(swings, closes, volumes):
+    """检测 VCP 收缩形态, 返回 {is_vcp, pivot, breakout, dry_up, quality, contractions}"""
+    result = {"is_vcp": False, "pivot": 0, "breakout": False, "dry_up": 1.0, "quality": 0, "n_contractions": 0}
+    if len(swings) < 5:
+        return result
+
+    # 提取 H-L 对
+    pairs = []
+    i = 0
+    while i < len(swings) - 1:
+        if swings[i][1] == "H":
+            j = i + 1
+            while j < len(swings) and swings[j][1] != "L":
+                j += 1
+            if j < len(swings) and swings[i][2] > 0 and swings[j][2] < swings[i][2]:
+                depth = (swings[i][2] - swings[j][2]) / swings[i][2]
+                pairs.append({"depth": depth, "high": swings[i][2], "low": swings[j][2]})
+            i = j + 1
+        else:
+            i += 1
+
+    if len(pairs) < VCP_MIN_CONTRACTIONS:
+        return result
+
+    # pivot = 最近的 swing high
+    pivot = None
+    for s in reversed(swings):
+        if s[1] == "H":
+            pivot = s[2]
+            break
+    if pivot is None:
+        return result
+
+    # 从末尾往前找最长的逐次收紧子序列
+    current_seq = [pairs[-1]]
+    for i in range(len(pairs) - 2, -1, -1):
+        prev_depth = current_seq[0]["depth"]
+        curr_depth = pairs[i]["depth"]
+        if curr_depth > 0 and curr_depth >= prev_depth * 0.5:
+            if curr_depth <= prev_depth / VCP_CONTRACTION_RATIO + 0.01:
+                current_seq.insert(0, pairs[i])
+            else:
+                break
+        else:
+            break
+
+    if len(current_seq) < VCP_MIN_CONTRACTIONS:
+        if len(pairs) >= 2 and pairs[-1]["depth"] < pairs[-2]["depth"] * VCP_CONTRACTION_RATIO:
+            current_seq = pairs[-2:]
+        else:
+            return result
+
+    t1 = current_seq[0]["depth"]
+    if t1 < VCP_T1_MIN or t1 > VCP_T1_MAX:
+        return result
+
+    # 量能枯竭
+    n = len(volumes)
+    vol_50d = np.mean(volumes[-50:]) if n >= 50 else np.mean(volumes)
+    vol_10d = np.mean(volumes[-10:]) if n >= 10 else np.mean(volumes)
+    dry_up = vol_10d / vol_50d if vol_50d > 0 else 1.0
+
+    # 突破检测
+    breakout = closes[-1] > pivot
+    breakout_vol = volumes[-1] / vol_50d if vol_50d > 0 else 0
+
+    # 质量评分
+    score = min(len(current_seq) * 10, 40)
+    score += max(0, 20 - current_seq[-1]["depth"] * 100)
+    if dry_up < 0.30: score += 20
+    elif dry_up < 0.50: score += 15
+    elif dry_up < 0.70: score += 10
+    if breakout and breakout_vol >= 1.5: score += 20
+    elif breakout: score += 10
+
+    result["is_vcp"] = True
+    result["pivot"] = round(pivot, 2)
+    result["breakout"] = breakout
+    result["dry_up"] = round(dry_up, 3)
+    result["quality"] = round(score, 1)
+    result["n_contractions"] = len(current_seq)
+    result["breakout_vol"] = round(breakout_vol, 2)
+    return result
+
+def scan_vcp_signals(klines):
+    """扫描所有股票的 VCP 形态, 返回 {code: vcp_info}"""
+    vcp_map = {}
+    stage2_count = 0
+    for code, k in klines.items():
+        if len(k) < VCP_LOOKBACK:
+            continue
+        closes = [b["close"] for b in k]
+        highs = [b["high"] for b in k]
+        lows = [b["low"] for b in k]
+        volumes = [b["volume"] for b in k]
+
+        # Stage 2 快速过滤
+        n = len(closes)
+        if n < 200:
+            continue
+        price = closes[-1]
+        ma50 = np.mean(closes[-50:])
+        ma150 = np.mean(closes[-150:])
+        ma200 = np.mean(closes[-200:])
+        if not (price > ma50 and ma150 > ma200 and price > ma200):
+            continue
+        high_52w = max(highs[-250:]) if n >= 250 else max(highs)
+        low_52w = min(lows[-250:]) if n >= 250 else min(lows)
+        if (price - low_52w) / low_52w < 0.15 or (high_52w - price) / high_52w > 0.35:
+            continue
+        stage2_count += 1
+
+        swings = _find_swings(highs, lows, VCP_SWING_WINDOW)
+        vcp = _detect_vcp_pattern(swings, closes, volumes)
+        if vcp["is_vcp"]:
+            vcp_map[code] = vcp
+
+    breakout_count = sum(1 for v in vcp_map.values() if v["breakout"])
+    print(f"  Stage2通过: {stage2_count}只 | VCP形态: {len(vcp_map)}只 | 突破确认: {breakout_count}只")
+    return vcp_map
 
 # ================================================================
 # Technical Indicators
@@ -468,12 +689,15 @@ def load_signals():
             print(f"  [WARN] 信号历史损坏，重置")
     return []
 
-def update_trades(rankings, extra_info, date_str):
+def update_trades(rankings, extra_info, date_str, market_trend=1):
     trades = load_trades()
     signals = load_signals()
     today_signals = {}
     n_total = len(rankings)
     rank_map = {r["code"]: r for r in rankings}
+
+    # 市场趋势门控: 空头时仓位上限减半
+    max_positions = MAX_POSITIONS if market_trend >= 0 else MAX_POSITIONS // 2
 
     for strategy in ["isir","glm","doubao"]:
         rank_key = f"{strategy}_rank"
@@ -500,6 +724,8 @@ def update_trades(rankings, extra_info, date_str):
                 exit_reason = f"止盈({current_ret:+.1f}%≥{TAKE_PROFIT_PCT}%)"
             elif current_rank > n_total * 0.5:
                 exit_reason = f"排名崩溃(#{current_rank})"
+            elif market_trend < 0 and current_ret < 0:
+                exit_reason = f"空头减仓({current_ret:+.1f}%)"
 
             if exit_reason:
                 # 信号日收盘触发，记录信号价；实际成交价在次日确认
@@ -533,7 +759,7 @@ def update_trades(rankings, extra_info, date_str):
         # New entries → 买入信号（仅在有空位时买入，排除今日卖出的股票避免反复买卖）
         existing_codes = {t["code"] for t in still_open}
         sold_today = {s["code"] for s in signals if s.get("strategy")==strategy and s.get("signal")=="sell" and s.get("date")==date_str}
-        available_slots = MAX_POSITIONS - len(still_open)
+        available_slots = max_positions - len(still_open)
         if available_slots > 0:
             new_candidates = sorted(
                 [(code, current_top_info[code][rank_key]) for code in current_top - existing_codes - sold_today],
@@ -573,9 +799,11 @@ def update_trades(rankings, extra_info, date_str):
 # 市场宽度 & 盘面解读（借鉴 market-breadth, Wyckoff-Analysis 等项目）
 # ================================================================
 
-def compute_market_overview(klines, extra_info, rankings):
+def compute_market_overview(klines, extra_info, rankings, index_klines=None, market_trend=None, market_trend_label=""):
     """计算市场宽度、指数状态、盘面解读"""
     result = {}
+    if market_trend is not None:
+        result["market_trend"] = {"trend": market_trend, "label": market_trend_label}
 
     # 1. 市场宽度：MA20以上占比
     above_ma20 = 0
@@ -890,6 +1118,14 @@ def _build_market_overview(mkt, rankings, extra_info, n_consensus, n_total, top_
       <div style="font-size:11px;color:#999">共识TOP{top_n}: {n_consensus}只 | 总计{n_total}只</div>
     </div>
 
+    <!-- 市场趋势门控 -->
+    <div class="mo-card" style="{"border-color:#dc2626" if mkt.get("market_trend",{}).get("trend",1) < 0 else ""}">
+      <div class="mo-title">市场趋势门控</div>
+      <div class="mo-big" style="color:{"#dc2626" if mkt.get("market_trend",{}).get("trend",1) < 0 else "#16a34a"}">{"空头" if mkt.get("market_trend",{}).get("trend",1) < 0 else "多头"}</div>
+      <div class="mo-sub">{mkt.get("market_trend",{}).get("label","-")}</div>
+      <div style="margin-top:6px;font-size:11px;color:{"#dc2626" if mkt.get("market_trend",{}).get("trend",1) < 0 else "var(--text-secondary)"}">{"仓位上限减半→15只, 浮亏强制减仓" if mkt.get("market_trend",{}).get("trend",1) < 0 else "仓位上限30只, 正常操作"}</div>
+    </div>
+
     <!-- 板块强弱 -->
     <div class="mo-card">
       <div class="mo-title">板块强弱</div>
@@ -1061,6 +1297,14 @@ def build_html(rankings, extra_info, history, trades, return_data, date_str, fre
             if r["in_isir_top"]: top_tags += '<span class="tag top-isir">ISIR</span>'
             if r["in_glm_top"]: top_tags += '<span class="tag top-glm">GLM</span>'
             if r["in_doubao_top"]: top_tags += '<span class="tag top-doubao">豆包</span>'
+            # VCP 标签
+            vcp_status = r.get("vcp_status", "")
+            vcp_badge = ""
+            if vcp_status == "突破":
+                vcp_badge = '<span class="tag top-vcp-breakout" title="VCP波动收缩形态突破确认">VCP突破</span>'
+            elif vcp_status == "预突破":
+                vcp_badge = '<span class="tag top-vcp-pre" title="VCP形态形成中,接近pivot">VCP预突破</span>'
+            top_tags += vcp_badge
             row_class = "row-consensus" if r["consensus"] else ""
 
             # === 可读技术面解读 ===
@@ -1336,7 +1580,7 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 .badge.sig-hold{{background:#2563eb;color:white;font-size:10px;margin-right:2px}}
 .badge.sig-watch{{background:#d97706;color:white;font-size:10px;margin-right:2px}}
 .tag{{padding:1px 5px;border-radius:4px;font-size:9px;font-weight:600;margin-right:2px}}
-.tag.top-isir{{background:#dbeafe;color:var(--isir-c)}}.tag.top-glm{{background:#ede9fe;color:var(--glm-c)}}.tag.top-doubao{{background:#d1fae5;color:var(--doubao-c)}}
+.tag.top-isir{{background:#dbeafe;color:var(--isir-c)}}.tag.top-glm{{background:#ede9fe;color:var(--glm-c)}}.tag.top-doubao{{background:#d1fae5;color:var(--doubao-c)}}.tag.top-vcp-breakout{{background:#fee2e2;color:#dc2626;font-weight:600}}.tag.top-vcp-pre{{background:#fef3c7;color:#d97706}}
 .ss-col{{color:var(--primary);font-weight:600;font-size:13px}}
 .section-title{{font-size:18px;font-weight:700;margin:28px 0 12px;color:var(--text)}}
 .detail-row td{{padding:0}}
@@ -1449,8 +1693,9 @@ function toggleSector(s){{var b=document.getElementById('sec-'+s)?.querySelector
 
 def main():
     print("="*60)
-    print("  统一评分引擎 v2.0")
-    print("  ISIR | GLM | 豆包 + 信号追踪 + 收益计算")
+    print("  统一评分引擎 v3.1")
+    print("  ISIR | GLM | 豆包 + 信号追踪 + 收益计算 + 市场趋势门控")
+    print("  ICIR权重重标定(2026-08-04) + 指数MA50仓位门控")
     print("="*60)
 
     if not os.path.exists(STOCK_CODES_FILE):
@@ -1466,7 +1711,7 @@ def main():
     print(f"  DB: K线最新 {freshness['kline_latest']} 行情最新 {freshness['extra_latest']}")
 
     print(f"\n  [1/4] 拉取数据...")
-    klines = db.get_klines(codes, days=130)
+    klines = db.get_klines(codes, days=300)
     extra_info = db.get_extra_info(codes, force_refresh=True)
     fund_flows = db.get_fund_flows(codes)
     print(f"  K线:{len(klines)} | 行情:{len(extra_info)} | 资金流:{len(fund_flows)}")
@@ -1479,10 +1724,31 @@ def main():
     rankings = compute_rankings(factor_data)
     n_consensus = sum(1 for r in rankings if r["consensus"])
 
+    # VCP 形态扫描
+    print(f"\n  [VCP扫描] 检测波动收缩形态...")
+    vcp_map = scan_vcp_signals(klines)
+    # 标注到排名数据
+    for r in rankings:
+        vcp = vcp_map.get(r["code"])
+        if vcp:
+            r["vcp_status"] = "突破" if vcp["breakout"] else "预突破"
+            r["vcp_info"] = vcp
+        else:
+            r["vcp_status"] = ""
+            r["vcp_info"] = None
+
+    # 市场趋势门控
+    print(f"\n  [市场趋势门控] 获取上证综指...")
+    index_klines = fetch_index_klines(days=300)
+    mkt_trend, mkt_ma50, mkt_idx_close, mkt_trend_label = calc_market_trend(index_klines)
+    print(f"  上证综指: {mkt_idx_close} | MA50: {mkt_ma50} | {mkt_trend_label}")
+    if mkt_trend < 0:
+        print(f"  ⚠️ 空头市场: 仓位上限 {MAX_POSITIONS}→{MAX_POSITIONS//2}, 浮亏持仓强制减仓")
+
     print(f"\n  [3/4] 信号追踪 + 交易更新...")
     date_str = datetime.now().strftime("%Y-%m-%d")
     history = save_history(rankings, extra_info, date_str)
-    trades, today_signals, signal_history = update_trades(rankings, extra_info, date_str)
+    trades, today_signals, signal_history = update_trades(rankings, extra_info, date_str, market_trend=mkt_trend)
 
     for strat in ["isir","glm","doubao"]:
         t = trades[strat]
@@ -1495,7 +1761,7 @@ def main():
 
     # 6. 市场全景解读
     print(f"\n  [盘面解读] 计算市场宽度...")
-    mkt_overview = compute_market_overview(klines, extra_info, rankings)
+    mkt_overview = compute_market_overview(klines, extra_info, rankings, index_klines, mkt_trend, mkt_trend_label)
     print(f"  MA20以上占比: {mkt_overview['breadth']['above_ma20_pct']}% | {mkt_overview['breadth']['temperature']}")
     print(f"  涨跌比: {mkt_overview['advance']['up']}:{mkt_overview['advance']['down']} | 涨停{mkt_overview['limits']['up']} 跌停{mkt_overview['limits']['down']}")
 
@@ -1510,6 +1776,9 @@ def main():
         best_strat = "isir"
 
     print(f"\n  [4/4] 生成报告... 共识TOP{TOP_N}: {n_consensus}只")
+    n_vcp_breakout = sum(1 for r in rankings if r.get("vcp_status") == "突破")
+    n_vcp_pre = sum(1 for r in rankings if r.get("vcp_status") == "预突破")
+    print(f"  VCP: 突破{n_vcp_breakout}只 | 预突破{n_vcp_pre}只")
     html = build_html(rankings, extra_info, history, trades, return_data, date_str, freshness, bt_summary, best_strat, mkt_overview, today_signals, signal_history)
     html_path = os.path.join(OUTPUT_DIR, f"unified_{date_str}.html")
     with open(html_path, "w", encoding="utf-8") as f: f.write(html)
@@ -1527,7 +1796,8 @@ def main():
         print(f"  共识标的:")
         for i,r in enumerate(consensus_list,1):
             name = extra_info.get(r["code"],{}).get("name","")
-            print(f"     {i}. {r['code']} {name} | ISIR#{r['isir_rank']} GLM#{r['glm_rank']} 豆包#{r['doubao_rank']}")
+            vcp_tag = f" VCP{r['vcp_status']}" if r.get("vcp_status") else ""
+            print(f"     {i}. {r['code']} {name} | ISIR#{r['isir_rank']} GLM#{r['glm_rank']} 豆包#{r['doubao_rank']}{vcp_tag}")
     print(f"  {'='*60}")
     db.stats()
     return html_path
