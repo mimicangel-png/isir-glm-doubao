@@ -315,6 +315,87 @@ def scan_vcp_signals(klines):
     return vcp_map
 
 # ================================================================
+# 外围市场门控 — 美股隔夜 + VIX
+# ================================================================
+
+def fetch_global_markets():
+    """获取外围市场数据 (美股指数+VIX, Yahoo Finance)"""
+    import urllib.request as ur
+    result = {}
+    sources = {
+        "^NDX": ("纳斯达克100", "科技板块情绪"),
+        "^DJI": ("道琼斯", "整体风险偏好"),
+        "^VIX": ("VIX恐慌指数", "市场恐慌度"),
+    }
+    for symbol, (name, impact) in sources.items():
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=5d&interval=1d"
+            req = ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp = ur.urlopen(req, timeout=10)
+            data = json.loads(resp.read().decode("utf-8"))
+            result_data = data.get("chart", {}).get("result", [{}])[0]
+            quotes = result_data.get("indicators", {}).get("quote", [{}])[0]
+            closes = [c for c in quotes.get("close", []) if c is not None]
+            if len(closes) >= 2:
+                last_close = closes[-1]
+                prev_close = closes[-2]
+                ret = (last_close / prev_close - 1) * 100 if prev_close > 0 else 0
+                if symbol == "^VIX":
+                    gate = "danger" if last_close > 30 else ("warning" if last_close > 20 else "normal")
+                else:
+                    gate = "danger" if ret < -3 else ("warning" if ret < -2 else "normal")
+                result[name] = {"close": round(last_close, 1), "overnight_ret": round(ret, 2), "impact": impact, "gate": gate}
+        except Exception:
+            result[name] = {"close": 0, "overnight_ret": 0, "impact": impact, "gate": "unknown"}
+    return result
+
+def compute_global_gate(global_markets):
+    """外围门控: 0=正常 1=警戒 2=危险"""
+    ndx_ret = global_markets.get("纳斯达克100", {}).get("overnight_ret", 0)
+    dji_ret = global_markets.get("道琼斯", {}).get("overnight_ret", 0)
+    vix_close = global_markets.get("VIX恐慌指数", {}).get("close", 0)
+
+    level = 0
+    pos_adjust = 1.0
+    gates = []
+
+    if vix_close > 30:
+        level = max(level, 2); pos_adjust = min(pos_adjust, 0.5)
+        gates.append(f"VIX={vix_close:.0f}>30 恐慌高位,仓位减半")
+    elif vix_close > 20:
+        level = max(level, 1); pos_adjust = min(pos_adjust, 0.75)
+        gates.append(f"VIX={vix_close:.0f}>20 波动加剧")
+
+    if ndx_ret < -3:
+        level = max(level, 2); pos_adjust = min(pos_adjust, 0.0)
+        gates.append(f"纳指{ndx_ret:+.1f}%<-3%暴跌,不开新仓")
+    elif ndx_ret < -2:
+        level = max(level, 1); pos_adjust = min(pos_adjust, 0.5)
+        gates.append(f"纳指{ndx_ret:+.1f}%<-2%大跌,仓位减半")
+
+    if dji_ret < -2:
+        level = max(level, 1); pos_adjust = min(pos_adjust, 0.5)
+        gates.append(f"道指{dji_ret:+.1f}%<-2%风险偏好下降")
+
+    if level == 0:
+        if ndx_ret > 1 and dji_ret > 1:
+            interp = f"外围隔夜大涨(纳指{ndx_ret:+.1f}%,道指{dji_ret:+.1f}%),A股今日大概率高开,科技板块偏正面"
+        elif ndx_ret > 0 and dji_ret > 0:
+            interp = f"外围隔夜小涨(纳指{ndx_ret:+.1f}%,道指{dji_ret:+.1f}%),情绪中性偏正面"
+        elif ndx_ret < -1 or dji_ret < -1:
+            interp = f"外围隔夜下跌(纳指{ndx_ret:+.1f}%,道指{dji_ret:+.1f}%),A股可能低开,注意止损"
+        else:
+            interp = f"外围隔夜平稳(纳指{ndx_ret:+.1f}%,道指{dji_ret:+.1f}%),无明显方向信号"
+    elif level == 1:
+        interp = f"外围警戒: {'; '.join(gates)}. 建议缩减仓位,谨慎操作"
+    else:
+        interp = f"外围危险: {'; '.join(gates)}. 强烈防御,不开新仓,浮亏果断止损"
+
+    vix_note = f"VIX={vix_close:.0f}" + ("(恐慌)" if vix_close > 25 else ("(正常)" if vix_close < 18 else "(偏高)"))
+    label = f"外围门控: {'危险' if level==2 else '警戒' if level==1 else '正常'} | {vix_note}"
+    return level, pos_adjust, label, interp
+
+# ================================================================
 # Technical Indicators
 # ================================================================
 
@@ -689,15 +770,16 @@ def load_signals():
             print(f"  [WARN] 信号历史损坏，重置")
     return []
 
-def update_trades(rankings, extra_info, date_str, market_trend=1):
+def update_trades(rankings, extra_info, date_str, market_trend=1, global_pos_adjust=1.0):
     trades = load_trades()
     signals = load_signals()
     today_signals = {}
     n_total = len(rankings)
     rank_map = {r["code"]: r for r in rankings}
 
-    # 市场趋势门控: 空头时仓位上限减半
-    max_positions = MAX_POSITIONS if market_trend >= 0 else MAX_POSITIONS // 2
+    # 综合仓位上限: 上证门控 × 外围门控
+    base_max = MAX_POSITIONS if market_trend >= 0 else MAX_POSITIONS // 2
+    max_positions = max(1, int(base_max * global_pos_adjust))
 
     for strategy in ["isir","glm","doubao"]:
         rank_key = f"{strategy}_rank"
@@ -1126,7 +1208,13 @@ def _build_market_overview(mkt, rankings, extra_info, n_consensus, n_total, top_
       <div style="margin-top:6px;font-size:11px;color:{"#dc2626" if mkt.get("market_trend",{}).get("trend",1) < 0 else "var(--text-secondary)"}">{"仓位上限减半→15只, 浮亏强制减仓" if mkt.get("market_trend",{}).get("trend",1) < 0 else "仓位上限30只, 正常操作"}</div>
     </div>
 
-    <!-- 板块强弱 -->
+    <!-- 外围市场门控 -->
+    <div class="mo-card" style="{"border-color:#dc2626" if mkt.get("global_gate",{}).get("level",0) >= 2 else ("border-color:#f59e0b" if mkt.get("global_gate",{}).get("level",0) == 1 else "")}">
+      <div class="mo-title">外围市场隔夜</div>
+      <div class="mo-big" style="color:{"#dc2626" if mkt.get("global_gate",{}).get("level",0) >= 2 else ("#f59e0b" if mkt.get("global_gate",{}).get("level",0) == 1 else "#16a34a")}">{"危险" if mkt.get("global_gate",{}).get("level",0) >= 2 else ("警戒" if mkt.get("global_gate",{}).get("level",0) == 1 else "正常")}</div>
+      <div style="font-size:11px;margin-top:4px">""" + "\n".join([f'{gname}: {ginfo["overnight_ret"]:+.2f}%' if gname != "VIX恐慌指数" else f'VIX: {ginfo["close"]}' for gname, ginfo in mkt.get("global_markets",{}).items()]) + f"""</div>
+      <div style="margin-top:6px;font-size:11px;color:var(--text-secondary)">{mkt.get("global_gate",{}).get("interpretation","")}</div>
+    </div>
     <div class="mo-card">
       <div class="mo-title">板块强弱</div>
       {sector_bars}
@@ -1693,9 +1781,9 @@ function toggleSector(s){{var b=document.getElementById('sec-'+s)?.querySelector
 
 def main():
     print("="*60)
-    print("  统一评分引擎 v3.1")
-    print("  ISIR | GLM | 豆包 + 信号追踪 + 收益计算 + 市场趋势门控")
-    print("  ICIR权重重标定(2026-08-04) + 指数MA50仓位门控")
+    print("  统一评分引擎 v3.2")
+    print("  ISIR | GLM | 豆包 + 信号追踪 + 双层门控(上证MA50+外围市场)")
+    print("  ICIR重标定 + VCP形态 + 外围市场门控")
     print("="*60)
 
     if not os.path.exists(STOCK_CODES_FILE):
@@ -1745,10 +1833,24 @@ def main():
     if mkt_trend < 0:
         print(f"  ⚠️ 空头市场: 仓位上限 {MAX_POSITIONS}→{MAX_POSITIONS//2}, 浮亏持仓强制减仓")
 
+    # 外围市场门控
+    print(f"\n  [外围市场门控] 获取美股隔夜数据...")
+    global_markets = fetch_global_markets()
+    global_level, global_pos_adj, global_label, global_interp = compute_global_gate(global_markets)
+    for gname, ginfo in global_markets.items():
+        ret_str = f"{ginfo['overnight_ret']:+.2f}%" if gname != "VIX恐慌指数" else f"close={ginfo['close']}"
+        print(f"  {gname}: {ret_str} | {ginfo['impact']} | 门控={ginfo['gate']}")
+    print(f"  → {global_label}")
+    print(f"  → {global_interp}")
+    # 综合仓位上限 (上证门控 × 外围门控)
+    effective_max = int(MAX_POSITIONS * (0.5 if mkt_trend < 0 else 1.0) * global_pos_adj)
+    if effective_max < MAX_POSITIONS:
+        print(f"  ⚠️ 综合仓位上限: {MAX_POSITIONS}→{effective_max}")
+
     print(f"\n  [3/4] 信号追踪 + 交易更新...")
     date_str = datetime.now().strftime("%Y-%m-%d")
     history = save_history(rankings, extra_info, date_str)
-    trades, today_signals, signal_history = update_trades(rankings, extra_info, date_str, market_trend=mkt_trend)
+    trades, today_signals, signal_history = update_trades(rankings, extra_info, date_str, market_trend=mkt_trend, global_pos_adjust=global_pos_adj)
 
     for strat in ["isir","glm","doubao"]:
         t = trades[strat]
@@ -1762,6 +1864,8 @@ def main():
     # 6. 市场全景解读
     print(f"\n  [盘面解读] 计算市场宽度...")
     mkt_overview = compute_market_overview(klines, extra_info, rankings, index_klines, mkt_trend, mkt_trend_label)
+    mkt_overview["global_markets"] = global_markets
+    mkt_overview["global_gate"] = {"level": global_level, "label": global_label, "interpretation": global_interp, "pos_adjust": global_pos_adj}
     print(f"  MA20以上占比: {mkt_overview['breadth']['above_ma20_pct']}% | {mkt_overview['breadth']['temperature']}")
     print(f"  涨跌比: {mkt_overview['advance']['up']}:{mkt_overview['advance']['down']} | 涨停{mkt_overview['limits']['up']} 跌停{mkt_overview['limits']['down']}")
 

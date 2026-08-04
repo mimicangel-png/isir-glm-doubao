@@ -1,10 +1,9 @@
-name: 每日评分报告
+name: 每日盘前评分报告
 
 on:
   schedule:
-    # 北京时间每天12:00和16:00（UTC 04:00和08:00），仅工作日
-    - cron: '0 4 * * 1-5'
-    - cron: '0 8 * * 1-5'
+    # 北京时间每天9:00（UTC 1:00），仅工作日
+    - cron: '0 1 * * 1-5'
   workflow_dispatch:  # 支持手动触发
 
 jobs:
@@ -81,7 +80,7 @@ jobs:
           msg = MIMEMultipart('alternative')
           msg['From'] = user
           msg['To'] = to
-          msg['Subject'] = f'统一评分决策日报 {date_str}'
+          msg['Subject'] = f'统一评分盘前日报 {date_str}'
 
           # HTML body（截断到安全的闭合点）
           if len(html_content) > 300000:
