@@ -327,6 +327,7 @@ def fetch_global_markets():
         "^DJI": ("道琼斯", "整体风险偏好"),
         "^VIX": ("VIX恐慌指数", "市场恐慌度"),
         "^N225": ("日经225", "亚太早盘风向"),
+        "^KS11": ("韩国KOSPI", "亚太半导体风向"),
     }
     for symbol, (name, impact) in sources.items():
         try:
