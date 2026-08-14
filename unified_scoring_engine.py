@@ -301,13 +301,24 @@ def scan_vcp_signals(klines):
             continue
         high_52w = max(highs[-250:]) if n >= 250 else max(highs)
         low_52w = min(lows[-250:]) if n >= 250 else min(lows)
-        if (price - low_52w) / low_52w < 0.15 or (high_52w - price) / high_52w > 0.35:
+        # Stage2 趋势硬过滤: 距低点涨幅不足15%直接剔除(趋势未确立)
+        if (price - low_52w) / low_52w < 0.15:
+            continue
+        # 距高点: ≤35%不扣分 | 35%-65%软扣分 | >65%硬剔除(偏离前高太远)
+        dist_high = (high_52w - price) / high_52w if high_52w > 0 else 0
+        if dist_high > 0.65:
             continue
         stage2_count += 1
 
         swings = _find_swings(highs, lows, VCP_SWING_WINDOW)
         vcp = _detect_vcp_pattern(swings, closes, volumes)
         if vcp["is_vcp"]:
+            # 距高点软扣分: 35%-50%扣0-10分, 50%-65%扣10-20分
+            if dist_high > 0.35:
+                penalty = min(20, (dist_high - 0.35) / 0.30 * 20)
+                vcp["quality"] = round(max(0, vcp["quality"] - penalty), 1)
+                vcp["dist_high_penalty"] = round(penalty, 1)
+            vcp["dist_high"] = round(dist_high, 3)
             vcp_map[code] = vcp
 
     breakout_count = sum(1 for v in vcp_map.values() if v["breakout"])
@@ -631,36 +642,162 @@ def compute_rankings(factor_data):
         isir_score = sum(ICIR_V3.get(f,0)*factors.get(f"{f}_z",0) for f in factor_names)
         glm_score = sum(ICIR_GLM.get(f,0)*factors.get(f"{f}_z",0) for f in factor_names)
 
-        # SS评分 — 完全对齐 scoring_engine_icir.py 源码算法
-        # 技术面: 基分50, 离散加分/减分
-        rsi_val = factors.get("_rsi",50)  # 直接用存储的原始RSI值
-        tech_delta = 0
-        # MA多头排列: MA5>MA10>MA20
+        # SS评分 — 完整恢复 stock-scoring 原始算法 (V9 回测驱动权重)
+        # 技术35% + 资金55% + 信息5% + 事件5%
+        # 修复日期: 2026-08-05 (此前迁移时丢失80%指标导致严重撞分)
+        close = factors.get("_close",0)
         ma5_v = factors.get("_ma5",0); ma10_v = factors.get("_ma10",0); ma20_v = factors.get("_ma20",0)
-        if ma5_v > ma10_v > ma20_v: tech_delta += 15
-        elif ma5_v < ma10_v < ma20_v: tech_delta -= 10  # 完整空头排列才扣分
-        # MACD: DIF>0 且 DIF>DEA
+        rsi_val = factors.get("_rsi",50)
         dif = factors.get("_dif",0); dea = factors.get("_dea",0)
-        if dif > 0 and dif > dea: tech_delta += 5
-        # RSI (A股阈值调整: 40-60中性, >85超买危险, <30超卖机会)
-        if rsi_val > 85: tech_delta -= 5   # 超买回调风险
-        elif rsi_val < 30: tech_delta += 8  # 超卖反弹机会
-        elif rsi_val < 40: tech_delta -= 3  # 偏弱
+        vol_ratio = factors.get("_vol_ratio",1)
+        vol_up_days = factors.get("vol_up_days",0.5)
+        pct_52w = factors.get("pct_52w",50)
+        dev_ma20 = factors.get("dev_ma20",0)
+        gap_open = factors.get("gap_open",0)
+        streak = factors.get("streak",0)
+        cmf_raw = factors.get("cmf",0)
+        mfi_val = factors.get("mfi",50)
+        vwap_premium = factors.get("vwap_premium",0)
+        main_5d = factors.get("main_flow_5d",0)
+        main_20d = factors.get("main_flow_20d",0)
+        inflow_rate = factors.get("inflow_rate",0)
+        log_mcap = factors.get("log_mcap",25)
+        amplitude_z = factors.get("amplitude_z",0)
+        event_score_raw = factors.get("event_score",0)
+        ret_5d = factors.get("ret_5d",0)
+        price_up = close > ma5_v  # 用价格vs MA5近似今日方向(原始用c[-1]>c[-2])
+
+        # ===== 技术面 (35%) — 6类指标 (原始stock-scoring完整版) =====
+        tech_delta = 0
+        # 1) 均线排列
+        if ma5_v and ma10_v and ma20_v:
+            if ma5_v > ma10_v > ma20_v:
+                tech_delta += 15
+            elif ma5_v < ma10_v < ma20_v:
+                tech_delta -= 10
+        # 2) MACD (与均线多头重叠时降权到2分, 避免双重计分)
+        if dif and dea and dif > dea and dif > 0:
+            if ma5_v and ma10_v and ma20_v and ma5_v > ma10_v > ma20_v:
+                tech_delta += 2
+            else:
+                tech_delta += 5
+        elif dif and dif < 0:
+            tech_delta -= 3
+        # 3) RSI四级细分
+        if 40 <= rsi_val <= 55:
+            tech_delta -= 3
+        if rsi_val > 80:
+            tech_delta += 12
+        elif rsi_val > 75:
+            tech_delta += 10
+        elif rsi_val < 30:
+            tech_delta -= 8
+        # 4) 量价关系四级 (放量上涨+8/缩量下跌-10/放量回调+5/巨量下跌-8)
+        if vol_ratio > 1.5 and price_up:
+            tech_delta += 8
+        elif not price_up:
+            if vol_ratio < 0.7:
+                tech_delta -= 10
+            elif 1.1 <= vol_ratio <= 1.5:
+                tech_delta += 5
+            elif vol_ratio > 1.5:
+                tech_delta -= 8
+        # 5) MA20偏离度
+        if ma20_v:
+            if 2 < dev_ma20 < 8:
+                tech_delta += 8
+            elif dev_ma20 > 15:
+                tech_delta -= 8
+            elif -5 < dev_ma20 < -2:
+                tech_delta -= 5
+        # 6) 52周位置
+        if pct_52w < 30:
+            tech_delta -= 8
+        elif pct_52w > 90:
+            tech_delta -= 5
         tech_score = max(5, min(95, 50 + tech_delta))
 
-        # 资金面: 基分50, CMF加减分
-        cmf_raw = factors.get("cmf",0)
+        # ===== 资金面 (55%) — 8+类指标 (原始stock-scoring完整版) =====
         cap_delta = 0
-        if cmf_raw > 0.1: cap_delta += 8
-        elif cmf_raw > 0: cap_delta += 3
-        elif cmf_raw < -0.1: cap_delta -= 8
-        elif cmf_raw < 0: cap_delta -= 3  # 对称: 微流出也扣分
+        # 1) CMF (2档严格阈值0.15)
+        if cmf_raw > 0.15:
+            cap_delta += 12
+        elif cmf_raw < -0.15:
+            cap_delta -= 10
+        # 2) MFI
+        if mfi_val < 40:
+            cap_delta -= 5
+        # 3) VWAP20突破 (与均线多头重叠时降权)
+        if vwap_premium > 3:
+            if ma5_v and ma10_v and ma20_v and ma5_v > ma10_v > ma20_v:
+                cap_delta += 1
+            else:
+                cap_delta += 3
+        # 4) 持续放量 (近5日4天以上放量)
+        if vol_up_days >= 0.8:
+            cap_delta += 10
+        # 5) 换手率异常 (量比20日)
+        if vol_ratio > 3:
+            if price_up:
+                cap_delta -= 5  # 巨量突破(回测T+10夏普低)
+            else:
+                cap_delta -= 6  # 巨量出货
+        elif vol_ratio > 2 and price_up:
+            cap_delta += 4
+        # 6) 振幅异常
+        if amplitude_z > 5:
+            if price_up:
+                cap_delta += 5
+            else:
+                cap_delta -= 5
+        # 7) 市值分层
+        mcap_val = math.exp(log_mcap) if log_mcap else 0
+        if mcap_val > 1e11:
+            cap_delta += 8
+        elif 0 < mcap_val < 5e9:
+            cap_delta -= 8
+        # 8) 主力资金净流向
+        if main_5d > 0 and main_20d > 0:
+            cap_delta += 8
+        elif main_5d > 0 and inflow_rate > 0.5:
+            cap_delta += 5
+        if main_5d < 0 and main_20d < 0:
+            cap_delta -= 8
+        elif main_5d < 0:
+            cap_delta -= 5
         capital_score = max(5, min(95, 50 + cap_delta))
 
-        # 信息面: 固定50
-        info_score = 50
+        # ===== 信息面 (5%) — 5类指标 (原始stock-scoring完整版) =====
+        info_delta = 0
+        # 1) 3日涨跌幅 (用ret_5d近似)
+        if ret_5d > 8:
+            info_delta += 15
+        elif ret_5d < -8:
+            info_delta -= 12
+        # 2) 跳空缺口
+        if abs(gap_open) > 3:
+            if gap_open > 0:
+                info_delta += 15
+            else:
+                info_delta -= 5
+        # 3) 量比
+        if vol_ratio > 3:
+            info_delta -= 3
+        elif vol_ratio > 2:
+            info_delta += 5
+        # 4) 三连涨
+        if streak >= 3:
+            info_delta += 8
+        # 5) 冲高回落封顶
+        if gap_open > 2 and not price_up:
+            info_delta = min(info_delta, 10)
+        info_score = max(5, min(95, 50 + info_delta))
 
-        ss_score = tech_score * 0.35 + capital_score * 0.55 + info_score * 0.10
+        # ===== 事件评分 (5%) — 衰减映射到0-50 =====
+        event_norm = 25 + max(-25, min(25, event_score_raw))
+
+        # ===== 最终加权 (V9: 技术35% + 资金55% + 信息5% + 事件5%) =====
+        ss_score = tech_score * 0.35 + capital_score * 0.55 + info_score * 0.05 + event_norm * 0.05
 
         # Top factor contributions
         contributions = []
@@ -675,6 +812,7 @@ def compute_rankings(factor_data):
             "code":code,"isir_score":round(isir_score,3),"glm_score":round(glm_score,3),
             "ss_score":round(ss_score,1),
             "ss_tech":round(tech_score,1),"ss_capital":round(capital_score,1),"ss_info":round(info_score,1),
+            "ss_event":round(event_norm,1),
             "top_factors":contributions[:8],
             "indicator":{
                 "close":factors.get("_close",0),"ma5":factors.get("_ma5",0),
@@ -1225,7 +1363,7 @@ def _build_market_overview(mkt, rankings, extra_info, n_consensus, n_total, top_
 </div>
 {bt_html}
 <div class="consensus-panel" style="display:{'block' if n_consensus>0 else 'none'};margin-top:12px">
-<h3>共识TOP{top_n} — ISIR ∩ GLM ∩ 豆包 ({n_consensus}只)</h3>
+<h3>共识TOP{top_n} — ISIR ∩ GLM ∩ SS分排名 ({n_consensus}只)</h3>
 <div class="consensus-list">{consensus_html}</div>
 </div>"""
 
@@ -1386,7 +1524,6 @@ def build_html(rankings, extra_info, history, trades, return_data, date_str, fre
             top_tags = ""
             if r["in_isir_top"]: top_tags += '<span class="tag top-isir">ISIR</span>'
             if r["in_glm_top"]: top_tags += '<span class="tag top-glm">GLM</span>'
-            if r["in_doubao_top"]: top_tags += '<span class="tag top-doubao">豆包</span>'
             # VCP 标签
             vcp_status = r.get("vcp_status", "")
             vcp_badge = ""
@@ -1508,7 +1645,6 @@ def build_html(rankings, extra_info, history, trades, return_data, date_str, fre
 <td class="num ss-col">{r['ss_score']:.1f}<span class="{arrow_cls(ss_diff)}" style="font-size:10px">{ss_arrow}</span></td>
 <td class="num rank-col"><span class="rank-num c-isir">#{r['isir_rank']}</span><span class="{arrow_cls(isir_diff)}">{isir_arrow}</span></td>
 <td class="num rank-col"><span class="rank-num c-glm">#{r['glm_rank']}</span><span class="{arrow_cls(glm_diff)}">{glm_arrow}</span></td>
-<td class="num rank-col"><span class="rank-num c-doubao">#{r['doubao_rank']}</span><span class="{arrow_cls(doubao_diff)}">{doubao_arrow}</span></td>
 <td>{sig_badge}{consensus_badge}{top_tags}</td>
 </tr>{detail_html}"""
         return rows
@@ -1590,7 +1726,7 @@ def build_html(rankings, extra_info, history, trades, return_data, date_str, fre
     # 回测结果
     bt_html = ""
     if backtest_summary and best_strat:
-        strat_names = {"isir":"ISIR","glm":"GLM","doubao":"豆包"}
+        strat_names = {"isir":"ISIR","glm":"GLM","doubao":"SS分排名"}
         bt_rows = ""
         for strat in ["isir","glm","doubao"]:
             s = backtest_summary[strat]
@@ -1610,10 +1746,10 @@ def build_html(rankings, extra_info, history, trades, return_data, date_str, fre
     # Tab ordering: best strategy first, then the rest
     all_tabs = [("overview","纵览","")]
     if best_strat:
-        all_tabs.append((best_strat, {"isir":"ISIR","glm":"GLM","doubao":"豆包"}[best_strat], f' style="color:{ {"isir":"var(--isir-c)","glm":"var(--glm-c)","doubao":"var(--doubao-c)"}[best_strat] }"'))
+        all_tabs.append((best_strat, {"isir":"ISIR","glm":"GLM","doubao":"SS分排名"}[best_strat], f' style="color:{ {"isir":"var(--isir-c)","glm":"var(--glm-c)","doubao":"var(--doubao-c)"}[best_strat] }"'))
     for s in ["isir","glm","doubao"]:
         if s != best_strat:
-            all_tabs.append((s, {"isir":"ISIR","glm":"GLM","doubao":"豆包"}[s], ""))
+            all_tabs.append((s, {"isir":"ISIR","glm":"GLM","doubao":"SS分排名"}[s], ""))
     all_tabs.append(("sector","板块",""))
     all_tabs.append(("signals","操作记录",""))
     all_tabs.append(("ss","SS分",""))
@@ -1719,7 +1855,7 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 <label>仅共识:</label><input type="checkbox" id="consensus-overview" onchange="filterPanel('overview')">
 <label>搜索:</label><input type="text" id="search-overview" placeholder="代码/名称" oninput="filterPanel('overview')" style="width:120px">
 </div><div class="table-wrap"><table><thead><tr>
-<th>代码</th><th>名称/板块</th><th>价格</th><th>日涨跌</th><th>5日</th><th>10日</th><th>20日</th><th>SS分</th><th>ISIR</th><th>GLM</th><th>豆包</th><th>共识</th>
+<th>代码</th><th>名称/板块</th><th>价格</th><th>日涨跌</th><th>5日</th><th>10日</th><th>20日</th><th>SS分</th><th>ISIR</th><th>GLM</th><th>共识</th>
 </tr></thead><tbody id="body-overview">{ss_rows}</tbody></table></div></div>
 
 <div class="panel" id="panel-ss"><div class="filter-bar">
@@ -1728,7 +1864,7 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 <label>搜索:</label><input type="text" id="search-ss" placeholder="代码/名称" oninput="filterPanel('ss')" style="width:120px">
 <small style="color:var(--text-secondary);margin-left:auto">按SS分从高到低排列</small>
 </div><div class="table-wrap"><table><thead><tr>
-<th>代码</th><th>名称/板块</th><th>价格</th><th>日涨跌</th><th>5日</th><th>10日</th><th>20日</th><th>SS分↓</th><th>ISIR</th><th>GLM</th><th>豆包</th><th>共识</th>
+<th>代码</th><th>名称/板块</th><th>价格</th><th>日涨跌</th><th>5日</th><th>10日</th><th>20日</th><th>SS分↓</th><th>ISIR</th><th>GLM</th><th>共识</th>
 </tr></thead><tbody id="body-ss">{ss_rows}</tbody></table></div></div>
 
 <div class="panel" id="panel-isir"><div class="filter-bar">
@@ -1737,7 +1873,7 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 <label>搜索:</label><input type="text" id="search-isir" placeholder="代码/名称" oninput="filterPanel('isir')" style="width:120px">
 <small style="color:var(--text-secondary);margin-left:auto">按ISIR排名</small>
 </div><div class="table-wrap"><table><thead><tr>
-<th>代码</th><th>名称/板块</th><th>价格</th><th>日涨跌</th><th>5日</th><th>10日</th><th>20日</th><th>SS分</th><th>ISIR↓</th><th>GLM</th><th>豆包</th><th>共识</th>
+<th>代码</th><th>名称/板块</th><th>价格</th><th>日涨跌</th><th>5日</th><th>10日</th><th>20日</th><th>SS分</th><th>ISIR↓</th><th>GLM</th><th>共识</th>
 </tr></thead><tbody id="body-isir">{isir_rows}</tbody></table></div>
 {trade_ledger_html('isir')}</div>
 
@@ -1747,7 +1883,7 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 <label>搜索:</label><input type="text" id="search-glm" placeholder="代码/名称" oninput="filterPanel('glm')" style="width:120px">
 <small style="color:var(--text-secondary);margin-left:auto">按GLM排名</small>
 </div><div class="table-wrap"><table><thead><tr>
-<th>代码</th><th>名称/板块</th><th>价格</th><th>日涨跌</th><th>5日</th><th>10日</th><th>20日</th><th>SS分</th><th>ISIR</th><th>GLM↓</th><th>豆包</th><th>共识</th>
+<th>代码</th><th>名称/板块</th><th>价格</th><th>日涨跌</th><th>5日</th><th>10日</th><th>20日</th><th>SS分</th><th>ISIR</th><th>GLM↓</th><th>共识</th>
 </tr></thead><tbody id="body-glm">{glm_rows}</tbody></table></div>
 {trade_ledger_html('glm')}</div>
 
@@ -1755,9 +1891,9 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 <label>板块:</label><select onchange="filterPanel('doubao')" id="sector-doubao"><option value="all">全部</option>{sector_options}</select>
 <label>仅共识:</label><input type="checkbox" id="consensus-doubao" onchange="filterPanel('doubao')">
 <label>搜索:</label><input type="text" id="search-doubao" placeholder="代码/名称" oninput="filterPanel('doubao')" style="width:120px">
-<small style="color:var(--text-secondary);margin-left:auto">按豆包排名</small>
+<small style="color:var(--text-secondary);margin-left:auto">按SS分排名</small>
 </div><div class="table-wrap"><table><thead><tr>
-<th>代码</th><th>名称/板块</th><th>价格</th><th>日涨跌</th><th>5日</th><th>10日</th><th>20日</th><th>SS分</th><th>ISIR</th><th>GLM</th><th>豆包↓</th><th>共识</th>
+<th>代码</th><th>名称/板块</th><th>价格</th><th>日涨跌</th><th>5日</th><th>10日</th><th>20日</th><th>SS分</th><th>ISIR</th><th>GLM</th><th>共识</th>
 </tr></thead><tbody id="body-doubao">{doubao_rows}</tbody></table></div>
 {trade_ledger_html('doubao')}</div>
 
@@ -1768,11 +1904,11 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 {sector_html}</div>
 
 <div class="footer"><p>统一评分引擎 v2.0 | 数据:腾讯财经 | 生成于 {timestr}</p>
-<p style="margin-top:3px;font-size:11px">ISIR=33因子ICIR原始加权 | GLM=mfi/pct_52w方向反转 | 豆包=SS传统评分(35/55/10) | 共识=三者∩ | 点击行展开因子明细 | 每策略含交易账本</p></div></div>
+<p style="margin-top:3px;font-size:11px">ISIR=33因子ICIR原始加权 | GLM=mfi/pct_52w方向反转 | SS分=传统技术评分(独立) | 共识=ISIR∩GLM∩SS分排名 | 点击行展开因子明细 | 每策略含交易账本</p></div></div>
 <script>
 function switchTab(n){{document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');[...document.querySelectorAll('.tab-btn')].find(b=>b.textContent.includes(n=='overview'?'纵览':n=='sector'?'板块':n.toUpperCase())||b.onclick.toString().includes("'"+n+"'"))?.classList.add('active')}}
 function toggleRow(id){{var r=document.getElementById(id);if(r)r.style.display=r.style.display==='none'?'table-row':'none'}}
-function filterPanel(name){{var s=document.getElementById('sector-'+name)?.value;var c=document.getElementById('consensus-'+name)?.checked;var q=(document.getElementById('search-'+name)?.value||'').toLowerCase();var rows=document.querySelectorAll('#body-'+name+' tr');rows.forEach(function(row){{if(row.classList.contains('detail-row'))return;var cells=row.getElementsByTagName('td');if(cells.length<12)return;var code=cells[0].textContent.trim();var nm=cells[1].textContent.trim();var badge=cells[11].textContent.trim();var show=true;if(s&&s!=='all'&&!cells[1].textContent.includes(s))show=false;if(c&&!badge.includes('共识'))show=false;if(q&&!code.toLowerCase().includes(q)&&!nm.toLowerCase().includes(q))show=false;row.style.display=show?'':'none';var next=row.nextElementSibling;if(next&&next.classList.contains('detail-row'))next.style.display=show?(next.style.display):'none'}})}}
+function filterPanel(name){{var s=document.getElementById('sector-'+name)?.value;var c=document.getElementById('consensus-'+name)?.checked;var q=(document.getElementById('search-'+name)?.value||'').toLowerCase();var rows=document.querySelectorAll('#body-'+name+' tr');rows.forEach(function(row){{if(row.classList.contains('detail-row'))return;var cells=row.getElementsByTagName('td');if(cells.length<11)return;var code=cells[0].textContent.trim();var nm=cells[1].textContent.trim();var badge=cells[10].textContent.trim();var show=true;if(s&&s!=='all'&&!cells[1].textContent.includes(s))show=false;if(c&&!badge.includes('共识'))show=false;if(q&&!code.toLowerCase().includes(q)&&!nm.toLowerCase().includes(q))show=false;row.style.display=show?'':'none';var next=row.nextElementSibling;if(next&&next.classList.contains('detail-row'))next.style.display=show?(next.style.display):'none'}})}}
 function toggleSector(s){{var b=document.getElementById('sec-'+s)?.querySelector('.sector-body');if(b)b.style.display=b.style.display==='none'?'block':'none'}}
 </script></body></html>"""
     return html
@@ -1784,7 +1920,7 @@ function toggleSector(s){{var b=document.getElementById('sec-'+s)?.querySelector
 def main():
     print("="*60)
     print("  统一评分引擎 v3.2")
-    print("  ISIR | GLM | 豆包 + 信号追踪 + 双层门控(上证MA50+外围市场)")
+    print("  ISIR | GLM | SS分排名 + 信号追踪 + 双层门控(上证MA50+外围市场)")
     print("  ICIR重标定 + VCP形态 + 外围市场门控")
     print("="*60)
 
@@ -1903,7 +2039,7 @@ def main():
         for i,r in enumerate(consensus_list,1):
             name = extra_info.get(r["code"],{}).get("name","")
             vcp_tag = f" VCP{r['vcp_status']}" if r.get("vcp_status") else ""
-            print(f"     {i}. {r['code']} {name} | ISIR#{r['isir_rank']} GLM#{r['glm_rank']} 豆包#{r['doubao_rank']}{vcp_tag}")
+            print(f"     {i}. {r['code']} {name} | ISIR#{r['isir_rank']} GLM#{r['glm_rank']} SS分排名#{r['doubao_rank']}{vcp_tag}")
     print(f"  {'='*60}")
     db.stats()
     return html_path
