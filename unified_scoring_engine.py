@@ -847,6 +847,82 @@ def compute_rankings(factor_data):
 
     return results
 
+
+# ================================================================
+# 超跌反弹评分 (第四体系，独立标记，不参与三体系共识)
+# ================================================================
+
+def compute_rebound_scores(rankings, klines, extra_info):
+    """
+    对所有股票计算超跌反弹趋势评分，注入到rankings中。
+    超跌反弹是逆向策略维度，与三体系(顺势)互补，独立标记不参与共识。
+
+    评分 = 超跌(30) + 反弹(35) + 趋势确认(20) + 风控(15)
+    硬性门槛: 超跌分≥5 且 总分≥20 才标记为有效超跌反弹信号
+    """
+    from oversold_rebound_engine import score_oversold_rebound_trend
+
+    rebound_list = []
+    for r in rankings:
+        code = r["code"]
+        kl = klines.get(code)
+        if not kl or len(kl) < 35:
+            r["rebound_score"] = 0
+            r["rebound_stage"] = ""
+            r["rebound_valid"] = False
+            continue
+
+        extra = extra_info.get(code, {})
+        # 构造stock字典
+        prev_close = kl[-2]["close"] if len(kl) >= 2 else (extra.get("price",0) or 0)
+        price = extra.get("price",0) or kl[-1]["close"]
+        stock = {
+            "code": code,
+            "name": extra.get("name", code),
+            "price": price,
+            "market": _get_market_name(code),
+            "mcap": extra.get("mcap", 0) or 0,
+            "amount": (kl[-1].get("volume",0) or 0) * price,
+            "pct": (price / prev_close - 1) * 100 if prev_close > 0 else 0,
+            "open": kl[-1].get("open", price),
+            "high": kl[-1].get("high", price),
+            "low": kl[-1].get("low", price),
+            "prev_close": prev_close,
+        }
+
+        result = score_oversold_rebound_trend(stock, kl)
+        if result and result["score"] >= 20 and result["oversold"] >= 5:
+            r["rebound_score"] = result["score"]
+            r["rebound_oversold"] = result["oversold"]
+            r["rebound_signal"] = result["signal"]
+            r["rebound_trend"] = result["trend"]
+            r["rebound_risk"] = result["risk"]
+            r["rebound_stage"] = result["rebound_stage"]
+            r["rebound_valid"] = True
+            r["rebound_atr"] = result["atr_advice"]
+            r["rebound_indicators"] = result["indicators"]
+            rebound_list.append(r)
+        else:
+            r["rebound_score"] = result["score"] if result else 0
+            r["rebound_stage"] = result["rebound_stage"] if result else ""
+            r["rebound_valid"] = False
+
+    # 排名
+    rebound_list.sort(key=lambda x: x["rebound_score"], reverse=True)
+    for i, r in enumerate(rebound_list):
+        r["rebound_rank"] = i + 1
+
+    return len(rebound_list)
+
+
+def _get_market_name(code):
+    if code.startswith("30"): return "创业板"
+    elif code.startswith("68"): return "科创板"
+    elif code.startswith(("8", "4")): return "北交所"
+    elif code.startswith("6"): return "沪主板"
+    return "深主板"
+
+
 # ================================================================
 # History & Trade Tracking
 # ================================================================
@@ -1492,6 +1568,54 @@ def _build_signal_history(signal_history, trades=None):
 </div>"""
 
 
+def _build_rebound_rows(rebound_list, extra_info):
+    """生成超跌反弹面板的表格行"""
+    rows = ""
+    for i, r in enumerate(rebound_list[:40]):
+        code = r["code"]
+        extra = extra_info.get(code, {})
+        name = extra.get("name", code)
+        price = extra.get("price", 0) or r.get("rebound_indicators", {}).get("close", 0)
+        ind = r.get("rebound_indicators", {})
+        atr = r.get("rebound_atr", {})
+        stage = r.get("rebound_stage", "")
+        stage_color = {"加速": "#dc2626", "确认": "#f59e0b", "初现": "#6b7280"}.get(stage, "#6b7280")
+
+        # 三体系标记
+        tags = ""
+        if r.get("consensus"): tags += '<span class="badge consensus">共识</span>'
+        if r.get("in_isir_top"): tags += '<span class="tag top-isir">ISIR</span>'
+        if r.get("in_glm_top"): tags += '<span class="tag top-glm">GLM</span>'
+        vcp = r.get("vcp_status", "")
+        if vcp == "突破": tags += '<span class="tag top-vcp-breakout">VCP突破</span>'
+        elif vcp == "预突破": tags += '<span class="tag top-vcp-pre">VCP预突破</span>'
+        if not tags: tags = '<span style="color:#ccc;font-size:11px">—</span>'
+
+        ret_5d = ind.get("ret_5d", 0)
+        rsi_v = ind.get("rsi", 50)
+
+        rows += f"""<tr class="{'row-consensus' if r.get('consensus') else ''}">
+<td>{i+1}</td>
+<td class="code-col">{code}</td>
+<td>{name}</td>
+<td class="num">{price:.2f}</td>
+<td class="num negative">{ret_5d:+.1f}%</td>
+<td class="num">{rsi_v:.0f}</td>
+<td class="num" style="color:#dc2626;font-weight:700">{r.get('rebound_score',0):.0f}</td>
+<td class="num">{r.get('rebound_oversold',0)}/30</td>
+<td class="num">{r.get('rebound_signal',0)}/35</td>
+<td class="num" style="color:#f59e0b;font-weight:600">{r.get('rebound_trend',0)}/20</td>
+<td class="num">{r.get('rebound_risk',0)}/15</td>
+<td><span style="background:{stage_color};color:white;padding:2px 8px;border-radius:8px;font-size:10px;font-weight:600">{stage}</span></td>
+<td class="num" style="color:#dc2626">{atr.get('stop_loss',0):.1f}%</td>
+<td class="num" style="color:#059669">{atr.get('take_profit',0):.1f}%</td>
+<td>{tags}</td>
+</tr>"""
+    if not rows:
+        rows = '<tr><td colspan="15" style="text-align:center;padding:30px;color:#999">今日无有效超跌反弹信号 (超跌分≥5+总分≥20)</td></tr>'
+    return rows
+
+
 def build_html(rankings, extra_info, history, trades, return_data, date_str, freshness, backtest_summary=None, best_strat=None, mkt_overview=None, today_signals=None, signal_history=None):
     n_total = len(rankings)
     n_consensus = sum(1 for r in rankings if r["consensus"])
@@ -1532,6 +1656,11 @@ def build_html(rankings, extra_info, history, trades, return_data, date_str, fre
             elif vcp_status == "预突破":
                 vcp_badge = '<span class="tag top-vcp-pre" title="VCP形态形成中,接近pivot">VCP预突破</span>'
             top_tags += vcp_badge
+            # 超跌反弹标记 (第四体系)
+            if r.get("rebound_valid"):
+                rb_stage = r.get("rebound_stage", "")
+                rb_score = r.get("rebound_score", 0)
+                top_tags += f'<span class="tag top-rebound" title="超跌反弹{rb_stage}: 总分{rb_score:.0f} (超跌{r.get("rebound_oversold",0)}/反弹{r.get("rebound_signal",0)}/趋势{r.get("rebound_trend",0)})">超跌{rb_stage}</span>'
             row_class = "row-consensus" if r["consensus"] else ""
 
             # === 可读技术面解读 ===
@@ -1660,6 +1789,11 @@ def build_html(rankings, extra_info, history, trades, return_data, date_str, fre
     glm_rows = build_panel_rows(rankings_glm, "glm")
     doubao_rows = build_panel_rows(rankings_doubao, "doubao")
 
+    # 超跌反弹面板行 (第四体系)
+    rebound_valid = [r for r in rankings if r.get("rebound_valid")]
+    rebound_valid.sort(key=lambda x: x.get("rebound_score", 0), reverse=True)
+    rebound_rows = _build_rebound_rows(rebound_valid, extra_info)
+
     # Sector view rows
     sector_groups = defaultdict(list)
     for r in rankings:
@@ -1753,6 +1887,7 @@ def build_html(rankings, extra_info, history, trades, return_data, date_str, fre
     all_tabs.append(("sector","板块",""))
     all_tabs.append(("signals","操作记录",""))
     all_tabs.append(("ss","SS分",""))
+    all_tabs.append(("rebound","超跌反弹",' style="color:#dc2626"'))
 
     tab_btns = ""
     for i, (tid, label, extra_style) in enumerate(all_tabs):
@@ -1806,7 +1941,7 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 .badge.sig-hold{{background:#2563eb;color:white;font-size:10px;margin-right:2px}}
 .badge.sig-watch{{background:#d97706;color:white;font-size:10px;margin-right:2px}}
 .tag{{padding:1px 5px;border-radius:4px;font-size:9px;font-weight:600;margin-right:2px}}
-.tag.top-isir{{background:#dbeafe;color:var(--isir-c)}}.tag.top-glm{{background:#ede9fe;color:var(--glm-c)}}.tag.top-doubao{{background:#d1fae5;color:var(--doubao-c)}}.tag.top-vcp-breakout{{background:#fee2e2;color:#dc2626;font-weight:600}}.tag.top-vcp-pre{{background:#fef3c7;color:#d97706}}
+.tag.top-isir{{background:#dbeafe;color:var(--isir-c)}}.tag.top-glm{{background:#ede9fe;color:var(--glm-c)}}.tag.top-doubao{{background:#d1fae5;color:var(--doubao-c)}}.tag.top-vcp-breakout{{background:#fee2e2;color:#dc2626;font-weight:600}}.tag.top-vcp-pre{{background:#fef3c7;color:#d97706}}.tag.top-rebound{{background:#fce7f3;color:#be185d;font-weight:600}}
 .ss-col{{color:var(--primary);font-weight:600;font-size:13px}}
 .section-title{{font-size:18px;font-weight:700;margin:28px 0 12px;color:var(--text)}}
 .detail-row td{{padding:0}}
@@ -1842,7 +1977,7 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 .sector-bar-val{{font-weight:600;min-width:50px}}
 @media(max-width:768px){{.dashboard{{grid-template-columns:repeat(3,1fr)}}.detail-grid{{grid-template-columns:1fr}}.mo-grid{{grid-template-columns:repeat(2,1fr)}}}}
 </style></head><body><div class="container">
-<div class="header"><h1>统一评分决策日报 v2.0</h1><div class="meta">日期:{date_str} | 股票池:{n_total}只 | K线:{freshness.get('kline_latest','-')} | 行情:{freshness.get('extra_latest','-')}</div></div>
+<div class="header"><h1>统一评分决策日报 v3.3</h1><div class="meta">日期:{date_str} | 股票池:{n_total}只 | K线:{freshness.get('kline_latest','-')} | 行情:{freshness.get('extra_latest','-')}</div></div>
 
 <!-- 市场全景解读面板 -->
 {_build_market_overview(mkt_overview, rankings, extra_info, n_consensus, n_total, TOP_N, bt_html if backtest_summary else "", consensus_html)}
@@ -1900,11 +2035,26 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 <!-- 历史操作建议记录面板 -->
 {_build_signal_history(signal_history, trades)}
 
+<!-- 超跌反弹面板 (第四体系，独立标记) -->
+<div class="panel" id="panel-rebound">
+<div class="filter-bar">
+<label>板块:</label><select onchange="filterPanel('rebound')" id="sector-rebound"><option value="all">全部</option>{sector_options}</select>
+<label>搜索:</label><input type="text" id="search-rebound" placeholder="代码/名称" oninput="filterPanel('rebound')" style="width:120px">
+<small style="color:#dc2626;margin-left:auto">超跌反弹趋势选股 v2.0 | 超跌30+反弹35+趋势20+风控15 | ATR动态止损</small>
+</div>
+<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:12px;color:#991b1b">
+<strong>超跌反弹体系说明:</strong> 独立于三体系(ISIR/GLM/SS)的逆向策略维度。三体系找"今天最强的"（顺势），超跌反弹找"跌狠了最可能反弹的"（逆向）。
+<span style="color:#6b7280">阶段: 初现(超跌未确认) → 确认(趋势反转) → 加速(反弹确立)。不参与三体系共识，独立标记。</span>
+</div>
+<div class="table-wrap"><table><thead><tr>
+<th>#</th><th>代码</th><th>名称</th><th>现价</th><th>5日</th><th>RSI</th><th>超跌分↓</th><th>超跌</th><th>反弹</th><th>趋势</th><th>风控</th><th>阶段</th><th>ATR止损</th><th>止盈</th><th>三体系</th>
+</tr></thead><tbody id="body-rebound">{rebound_rows}</tbody></table></div></div>
+
 <div class="panel" id="panel-sector"><div class="section-title">按板块纵览</div>
 {sector_html}</div>
 
-<div class="footer"><p>统一评分引擎 v2.0 | 数据:腾讯财经 | 生成于 {timestr}</p>
-<p style="margin-top:3px;font-size:11px">ISIR=33因子ICIR原始加权 | GLM=mfi/pct_52w方向反转 | SS分=传统技术评分(独立) | 共识=ISIR∩GLM∩SS分排名 | 点击行展开因子明细 | 每策略含交易账本</p></div></div>
+<div class="footer"><p>统一评分引擎 v3.3 | 数据:腾讯财经 | 生成于 {timestr}</p>
+<p style="margin-top:3px;font-size:11px">ISIR=33因子ICIR原始加权 | GLM=mfi/pct_52w方向反转 | SS分=传统技术评分(独立) | 超跌反弹=逆向策略维度(独立标记) | 共识=ISIR∩GLM∩SS分排名 | 点击行展开因子明细 | 每策略含交易账本</p></div></div>
 <script>
 function switchTab(n){{document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');[...document.querySelectorAll('.tab-btn')].find(b=>b.textContent.includes(n=='overview'?'纵览':n=='sector'?'板块':n.toUpperCase())||b.onclick.toString().includes("'"+n+"'"))?.classList.add('active')}}
 function toggleRow(id){{var r=document.getElementById(id);if(r)r.style.display=r.style.display==='none'?'table-row':'none'}}
@@ -1919,9 +2069,9 @@ function toggleSector(s){{var b=document.getElementById('sec-'+s)?.querySelector
 
 def main():
     print("="*60)
-    print("  统一评分引擎 v3.2")
-    print("  ISIR | GLM | SS分排名 + 信号追踪 + 双层门控(上证MA50+外围市场)")
-    print("  ICIR重标定 + VCP形态 + 外围市场门控")
+    print("  统一评分引擎 v3.3")
+    print("  ISIR | GLM | SS分排名 | 超跌反弹 + 信号追踪 + 双层门控")
+    print("  ICIR重标定 + VCP形态 + 外围市场门控 + 超跌反弹趋势")
     print("="*60)
 
     if not os.path.exists(STOCK_CODES_FILE):
@@ -1962,6 +2112,11 @@ def main():
         else:
             r["vcp_status"] = ""
             r["vcp_info"] = None
+
+    # 超跌反弹评分 (第四体系，独立标记，不参与三体系共识)
+    print(f"\n  [超跌反弹] 扫描超跌反弹趋势信号...")
+    n_rebound = compute_rebound_scores(rankings, klines, extra_info)
+    print(f"  超跌反弹有效: {n_rebound}只 (超跌分≥5+总分≥20)")
 
     # 市场趋势门控
     print(f"\n  [市场趋势门控] 获取上证综指...")
@@ -2029,6 +2184,7 @@ def main():
     with open(json_path, "w") as f: json.dump(rankings, f, ensure_ascii=False, indent=2)
 
     consensus_list = [r for r in rankings if r["consensus"]]
+    rebound_list = [r for r in rankings if r.get("rebound_valid")]
     print(f"\n  {'='*60}")
     print(f"  ✅ 报告已生成!")
     print(f"     HTML: {html_path}")
@@ -2039,7 +2195,17 @@ def main():
         for i,r in enumerate(consensus_list,1):
             name = extra_info.get(r["code"],{}).get("name","")
             vcp_tag = f" VCP{r['vcp_status']}" if r.get("vcp_status") else ""
-            print(f"     {i}. {r['code']} {name} | ISIR#{r['isir_rank']} GLM#{r['glm_rank']} SS分排名#{r['doubao_rank']}{vcp_tag}")
+            rb_tag = f" 超跌{r.get('rebound_stage','')}" if r.get("rebound_valid") else ""
+            print(f"     {i}. {r['code']} {name} | ISIR#{r['isir_rank']} GLM#{r['glm_rank']} SS分排名#{r['doubao_rank']}{vcp_tag}{rb_tag}")
+    if rebound_list:
+        print(f"  超跌反弹标的({len(rebound_list)}只):")
+        for i,r in enumerate(rebound_list[:5],1):
+            name = extra_info.get(r["code"],{}).get("name","")
+            ind = r.get("rebound_indicators",{})
+            atr = r.get("rebound_atr",{})
+            print(f"     {i}. {r['code']} {name} | 超跌分{r['rebound_score']:.0f} "
+                  f"(超跌{r['rebound_oversold']}/反弹{r['rebound_signal']}/趋势{r['rebound_trend']}) "
+                  f"[{r['rebound_stage']}] 5日{ind.get('ret_5d',0):+.1f}% 止损{atr.get('stop_loss',0):.1f}%")
     print(f"  {'='*60}")
     db.stats()
     return html_path
