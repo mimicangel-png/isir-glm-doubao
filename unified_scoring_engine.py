@@ -918,7 +918,7 @@ def compute_rebound_scores(rankings, klines, extra_info):
 def _get_market_name(code):
     if code.startswith("30"): return "创业板"
     elif code.startswith("68"): return "科创板"
-    elif code.startswith(("8", "4")): return "北交所"
+    elif code.startswith(("8", "4", "92")): return "北交所"
     elif code.startswith("6"): return "沪主板"
     return "深主板"
 
@@ -1199,9 +1199,36 @@ def compute_market_overview(klines, extra_info, rankings, index_klines=None, mar
     flat_count = len(rankings) - up_count - down_count
     result["advance"] = {"up": up_count, "down": down_count, "flat": flat_count}
 
-    # 5. 涨停/跌停统计（涨跌>9.5%近似）
-    limit_up = sum(1 for r in rankings if abs(extra_info.get(r["code"],{}).get("change_pct",0)) > 9.5 and extra_info.get(r["code"],{}).get("change_pct",0) > 0)
-    limit_down = sum(1 for r in rankings if abs(extra_info.get(r["code"],{}).get("change_pct",0)) > 9.5 and extra_info.get(r["code"],{}).get("change_pct",0) < 0)
+    # 5. 涨停/跌停统计 — 修复(2026-09-14): 原固定9.5%阈值会把创业板/科创板20cm、北交所30cm的
+    #    未涨停大涨(如+10%)误计为涨停。现按板块规则分阈值: 主板10%/创业板科创板20%/北交所30%。
+    #    优先用腾讯精确涨停价(zt_price/dt_price)判断, 无涨停价时回退到分板阈值。
+    def _limit_pct(code):
+        if code.startswith(("30", "68")):
+            return 20.0
+        if code.startswith(("8", "4", "92")):
+            return 30.0
+        return 10.0
+
+    limit_up = 0
+    limit_down = 0
+    for r in rankings:
+        code = r["code"]
+        extra = extra_info.get(code, {})
+        chg = extra.get("change_pct", 0) or 0
+        price = extra.get("price", 0) or 0
+        zt = extra.get("zt_price", 0) or 0
+        dt = extra.get("dt_price", 0) or 0
+        if zt > 0 and price > 0:
+            if price >= zt - 0.005:
+                limit_up += 1
+            if price <= dt + 0.005:
+                limit_down += 1
+        else:
+            thr = _limit_pct(code) * 0.98
+            if chg > thr:
+                limit_up += 1
+            elif chg < -thr:
+                limit_down += 1
     result["limits"] = {"up": limit_up, "down": limit_down}
 
     # 6. 成交量
@@ -1253,15 +1280,23 @@ def run_backtest(klines, extra_info, sectors, backtest_days=180):
 
             # 用历史K线推算extra_info，避免前视偏差
             # 预计算每只股票的股本(从今日市值/今日收盘价反推)
+            # 修复(2026-09-14): ①mcap已改为总市值(原为流通市值) ②新增流通股本用于换手率
+            # ③腾讯K线volume单位是手, 换算为股需×100(原直接相除导致换手率低100倍)
             shares_cache = {}
+            float_shares_cache = {}
             for code in day_klines:
                 today_info = extra_info.get(code, {})
                 tp = today_info.get("price", 0)
-                tm = today_info.get("mcap", 0)
+                tm = today_info.get("mcap", 0)          # 总市值(元)
+                tfm = today_info.get("float_mcap", 0)   # 流通市值(元)
                 if tp > 0 and tm > 0:
-                    shares_cache[code] = tm / tp  # 股本(股)
+                    shares_cache[code] = tm / tp        # 总股本(股)
                 else:
                     shares_cache[code] = 0
+                if tp > 0 and tfm > 0:
+                    float_shares_cache[code] = tfm / tp # 流通股本(股)
+                else:
+                    float_shares_cache[code] = 0
 
             day_extra = {}
             for code in day_klines:
@@ -1272,8 +1307,10 @@ def run_backtest(klines, extra_info, sectors, backtest_days=180):
                     vr = last["volume"] / avg_vol_5 if avg_vol_5 > 0 else 1.0
                     # 用股本反推历史市值和换手率
                     shares = shares_cache.get(code, 0)
+                    float_shares = float_shares_cache.get(code, 0)
                     hist_mcap = last["close"] * shares if shares > 0 else 0
-                    hist_turnover = (last["volume"] / shares * 100) if shares > 0 else 0
+                    # volume单位是手(100股/手); 换手率=成交量(股)/流通股本×100
+                    hist_turnover = (last["volume"] * 100 / float_shares * 100) if float_shares > 0 else 0
                     today_info = extra_info.get(code, {})
                     day_extra[code] = {
                         "name": today_info.get("name", code),
@@ -1281,8 +1318,8 @@ def run_backtest(klines, extra_info, sectors, backtest_days=180):
                         "change_pct": (last["close"]/prev["close"]-1)*100,
                         "pe_ttm": today_info.get("pe_ttm", 0) or 0,  # 用今日PE近似(有偏差但优于0)
                         "pb": today_info.get("pb", 0) or 0,
-                        "mcap": hist_mcap,           # 从股本反推
-                        "turnover": hist_turnover,   # 从股本反推
+                        "mcap": hist_mcap,           # 从总股本反推的历史总市值
+                        "turnover": hist_turnover,   # 从流通股本反推(手→股换算修复)
                         "vol_ratio": vr,
                     }
 

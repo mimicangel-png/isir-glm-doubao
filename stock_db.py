@@ -4,7 +4,7 @@
 统一数据层：K线、实时行情、资金流、公告事件
 """
 
-import os, json, sqlite3, urllib.request, subprocess
+import os, json, sqlite3, urllib.request, subprocess, re
 from datetime import datetime, timedelta
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS extra_info (
     code TEXT NOT NULL, date TEXT NOT NULL,
     name TEXT, price REAL, change_pct REAL,
     pe_ttm REAL, pb REAL, mcap REAL, turnover REAL, vol_ratio REAL,
+    float_mcap REAL, zt_price REAL, dt_price REAL,
     fetched_at TEXT DEFAULT (datetime('now')),
     PRIMARY KEY (code, date)
 );
@@ -77,6 +78,13 @@ class StockDB:
     def _init_db(self):
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            # 迁移: 旧表补充新列(幂等)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(extra_info)")}
+            for col, ddl in [("float_mcap","ALTER TABLE extra_info ADD COLUMN float_mcap REAL"),
+                             ("zt_price","ALTER TABLE extra_info ADD COLUMN zt_price REAL"),
+                             ("dt_price","ALTER TABLE extra_info ADD COLUMN dt_price REAL")]:
+                if col not in cols:
+                    conn.execute(ddl)
 
     @staticmethod
     def _to_symbol(code):
@@ -175,10 +183,10 @@ class StockDB:
             with self._connect() as conn:
                 for code in codes:
                     row = conn.execute(
-                        "SELECT name,price,change_pct,pe_ttm,pb,mcap,turnover,vol_ratio FROM extra_info WHERE code=? AND date=?",
+                        "SELECT name,price,change_pct,pe_ttm,pb,mcap,turnover,vol_ratio,float_mcap,zt_price,dt_price FROM extra_info WHERE code=? AND date=?",
                         (code, today)).fetchone()
                     if row:
-                        result[code] = {"name":row[0],"price":row[1],"change_pct":row[2],"pe_ttm":row[3],"pb":row[4],"mcap":row[5],"turnover":row[6],"vol_ratio":row[7]}
+                        result[code] = {"name":row[0],"price":row[1],"change_pct":row[2],"pe_ttm":row[3],"pb":row[4],"mcap":row[5],"turnover":row[6],"vol_ratio":row[7],"float_mcap":row[8] or 0,"zt_price":row[9] or 0,"dt_price":row[10] or 0}
                     else:
                         need_fetch.append(code)
         if need_fetch:
@@ -200,11 +208,15 @@ class StockDB:
                     vals = line.split('"')[1].split("~")
                     if len(vals) < 55: continue
                     code = line.split("=")[0].split("_")[-1][2:]
+                    # 字段口径(2026-09-14验证): vals[44]=流通市值(亿) vals[45]=总市值(亿) vals[47]=涨停价 vals[48]=跌停价
                     info = {"name":vals[1],"price":float(vals[3]) if vals[3] else 0,
                             "change_pct":float(vals[32]) if vals[32] else 0,
                             "pe_ttm":float(vals[39]) if vals[39] else 0,
                             "pb":float(vals[46]) if vals[46] else 0,
-                            "mcap":float(vals[44])*1e8 if vals[44] else 0,
+                            "mcap":float(vals[45])*1e8 if vals[45] else 0,        # 总市值(元) — 修复: 原误取字段44流通市值
+                            "float_mcap":float(vals[44])*1e8 if vals[44] else 0,   # 流通市值(元)
+                            "zt_price":float(vals[47]) if vals[47] else 0,         # 涨停价(精确)
+                            "dt_price":float(vals[48]) if vals[48] else 0,         # 跌停价(精确)
                             "turnover":float(vals[38]) if vals[38] else 0,
                             "vol_ratio":float(vals[49]) if vals[49] else 0}
                     result[code] = info
@@ -212,14 +224,15 @@ class StockDB:
                     self._log_fetch(code, today, "extra", "ok")
             except Exception as e:
                 for c in batch:
-                    self._log_fetch(c.strip("shsz"), today, "extra", "failed", str(e)[:200])
+                    # 修复: strip("shsz")会误剥bj前缀, 统一去市场前缀取后6位数字代码
+                    self._log_fetch(re.sub(r"^(sh|sz|bj)", "", c), today, "extra", "failed", str(e)[:200])
         return result
 
     def _save_extra(self, code, date, info):
         with self._connect() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO extra_info(code,date,name,price,change_pct,pe_ttm,pb,mcap,turnover,vol_ratio) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (code,date,info["name"],info["price"],info["change_pct"],info["pe_ttm"],info["pb"],info["mcap"],info["turnover"],info["vol_ratio"]))
+                "INSERT OR REPLACE INTO extra_info(code,date,name,price,change_pct,pe_ttm,pb,mcap,turnover,vol_ratio,float_mcap,zt_price,dt_price) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (code,date,info["name"],info["price"],info["change_pct"],info["pe_ttm"],info["pb"],info["mcap"],info["turnover"],info["vol_ratio"],info.get("float_mcap",0),info.get("zt_price",0),info.get("dt_price",0)))
 
     def get_fund_flows(self, codes):
         today = datetime.now().strftime("%Y-%m-%d")
@@ -227,7 +240,13 @@ class StockDB:
         need_fetch = []
         with self._connect() as conn:
             for code in codes:
-                row = conn.execute("SELECT main_net_5d,main_net_20d,inflow_rate,jumbo_net,main_net_today FROM fund_flows WHERE code=? AND date=?",(code,today)).fetchone()
+                # 修复(2026-09-14): 资金流数据源改为通达信MCP定时任务写入(收盘后16:35),
+                # 数据可能滞后当日(盘前读到的是昨日完整数据)。取≤today的最近记录而非严格等于today,
+                # 避免tdx完整5/20日数据(写在上一个交易日)被错过。
+                row = conn.execute(
+                    "SELECT main_net_5d,main_net_20d,inflow_rate,jumbo_net,main_net_today FROM fund_flows "
+                    "WHERE code=? AND date<=? ORDER BY date DESC LIMIT 1",
+                    (code, today)).fetchone()
                 if row: result[code] = dict(zip(["main_net_5d","main_net_20d","inflow_rate","jumbo_net","main_net_today"], row))
                 else: need_fetch.append(code)
         if need_fetch:

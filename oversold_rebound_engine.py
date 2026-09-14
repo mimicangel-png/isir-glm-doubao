@@ -126,7 +126,7 @@ def fetch_pool_stocks():
             market = "创业板"
         elif code.startswith("68"):
             market = "科创板"
-        elif code.startswith(("8", "4")):
+        elif code.startswith(("8", "4", "92")):
             market = "北交所"
         elif code.startswith("6"):
             market = "沪主板"
@@ -146,7 +146,7 @@ def fetch_pool_stocks():
 def fetch_kline(code, days=80):
     """获取单只股票K线（腾讯API）"""
     prefix = "sh" if code.startswith(("6", "5")) else "sz"
-    if code.startswith(("8", "4")):
+    if code.startswith(("8", "4", "92")):
         prefix = "bj"
     url = (f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
            f"?param={prefix}{code},day,,,{days},qfq")
@@ -329,7 +329,7 @@ def score_oversold_rebound_trend(stock, klines):
         limit_pct = 20
     elif code.startswith("68"):
         limit_pct = 20
-    elif code.startswith(("8", "4")):
+    elif code.startswith(("8", "4", "92")):
         limit_pct = 30
     else:
         limit_pct = 10
