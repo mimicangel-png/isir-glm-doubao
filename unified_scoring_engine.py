@@ -42,6 +42,11 @@ STOP_LOSS_PCT = -8.0   # 止损线
 TAKE_PROFIT_PCT = 15.0  # 止盈线
 MAX_POSITIONS = 30      # 最大持仓数
 
+# 第五视图: 质量反弹 = 超跌反弹(第四体系) ∩ (ISIR或GLM排名≤QR_THRESHOLD)
+# 回测依据(2026-09-14, 180日): 交叉组20日胜率55.5%/均收益+6.4% vs 纯超跌49.8%/+2.2% vs 全池48.1%/+2.1%
+QR_THRESHOLD = 150
+QR_BACKTEST_FILE = os.path.join(OUTPUT_DIR, "quality_rebound_backtest.json")
+
 # ================================================================
 # ICIR Weights — 精确来自 scoring_engine_icir.py / v3_vs_glm_tracker.py
 # ================================================================
@@ -1605,10 +1610,10 @@ def _build_signal_history(signal_history, trades=None):
 </div>"""
 
 
-def _build_rebound_rows(rebound_list, extra_info):
-    """生成超跌反弹面板的表格行"""
+def _build_qrebound_rows(qr_list, extra_info):
+    """第五视图: 质量反弹面板表格行 (超跌反弹 ∩ ISIR/GLM前QR_THRESHOLD)"""
     rows = ""
-    for i, r in enumerate(rebound_list[:40]):
+    for i, r in enumerate(qr_list[:40]):
         code = r["code"]
         extra = extra_info.get(code, {})
         name = extra.get("name", code)
@@ -1617,8 +1622,9 @@ def _build_rebound_rows(rebound_list, extra_info):
         atr = r.get("rebound_atr", {})
         stage = r.get("rebound_stage", "")
         stage_color = {"加速": "#dc2626", "确认": "#f59e0b", "初现": "#6b7280"}.get(stage, "#6b7280")
+        sector = sector_map.get_sector(code)
+        best_rank = min(r.get("isir_rank", 9999), r.get("glm_rank", 9999))
 
-        # 三体系标记
         tags = ""
         if r.get("consensus"): tags += '<span class="badge consensus">共识</span>'
         if r.get("in_isir_top"): tags += '<span class="tag top-isir">ISIR</span>'
@@ -1628,32 +1634,65 @@ def _build_rebound_rows(rebound_list, extra_info):
         elif vcp == "预突破": tags += '<span class="tag top-vcp-pre">VCP预突破</span>'
         if not tags: tags = '<span style="color:#ccc;font-size:11px">—</span>'
 
-        ret_5d = ind.get("ret_5d", 0)
-        rsi_v = ind.get("rsi", 50)
-
-        rows += f"""<tr class="{'row-consensus' if r.get('consensus') else ''}">
+        rows += f"""<tr>
 <td>{i+1}</td>
 <td class="code-col">{code}</td>
-<td>{name}</td>
+<td>{name} <small style="color:#999">{sector}</small></td>
 <td class="num">{price:.2f}</td>
-<td class="num negative">{ret_5d:+.1f}%</td>
-<td class="num">{rsi_v:.0f}</td>
+<td class="num negative">{ind.get('ret_5d',0):+.1f}%</td>
+<td class="num">{ind.get('rsi',50):.0f}</td>
 <td class="num" style="color:#dc2626;font-weight:700">{r.get('rebound_score',0):.0f}</td>
-<td class="num">{r.get('rebound_oversold',0)}/30</td>
-<td class="num">{r.get('rebound_signal',0)}/35</td>
-<td class="num" style="color:#f59e0b;font-weight:600">{r.get('rebound_trend',0)}/20</td>
-<td class="num">{r.get('rebound_risk',0)}/15</td>
 <td><span style="background:{stage_color};color:white;padding:2px 8px;border-radius:8px;font-size:10px;font-weight:600">{stage}</span></td>
-<td class="num" style="color:#dc2626">{atr.get('stop_loss',0):.1f}%</td>
-<td class="num" style="color:#059669">{atr.get('take_profit',0):.1f}%</td>
+<td class="num" style="color:var(--isir-c)">#{r.get('isir_rank','-')}</td>
+<td class="num" style="color:var(--glm-c)">#{r.get('glm_rank','-')}</td>
+<td class="num" style="font-weight:700">#{best_rank}</td>
+<td class="num" style="color:#dc2626">{atr.get('stop_price',0):.2f}</td>
+<td class="num" style="color:#059669">{atr.get('tp_price',0):.2f}</td>
 <td>{tags}</td>
 </tr>"""
     if not rows:
-        rows = '<tr><td colspan="15" style="text-align:center;padding:30px;color:#999">今日无有效超跌反弹信号 (超跌分≥5+总分≥20)</td></tr>'
+        rows = f'<tr><td colspan="14" style="text-align:center;padding:30px;color:#999">今日无质量反弹信号 (超跌反弹 ∩ ISIR/GLM前{QR_THRESHOLD}名 交集体为空 — 黄金坑未出现)</td></tr>'
     return rows
 
 
-def build_html(rankings, extra_info, history, trades, return_data, date_str, freshness, backtest_summary=None, best_strat=None, mkt_overview=None, today_signals=None, signal_history=None):
+def _build_qrebound_backtest_html(qr_backtest):
+    """第五视图: 质量反弹回测对比表"""
+    if not qr_backtest:
+        return '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:10px 14px;font-size:12px;color:#991b1b">回测数据缺失: 请运行 quality_rebound_backtest.py 生成 output/quality_rebound_backtest.json</div>'
+    groups = qr_backtest.get("groups", {})
+    bear = qr_backtest.get("bear", {})
+    rows_html = ""
+    label_map = {"all": "全池基线", "pure": "纯超跌反弹", "pure_s40": "纯超跌·高分≥40", "confirm": "纯超跌·确认阶段", "cross100": "交叉(前100)", "cross150": "交叉(前150)⭐", "cross150_confirm": "交叉(前150)·确认", "cross200": "交叉(前200)", "cross250": "交叉(前250)"}
+    for g in ["all", "pure", "pure_s40", "confirm", "cross100", "cross150", "cross150_confirm", "cross200", "cross250"]:
+        if g not in groups: continue
+        s20 = groups[g].get("ret20", {})
+        b = bear.get(g, {}).get("bear20", {})
+        bl = bear.get(g, {}).get("bull20", {})
+        hl = ' style="background:#f0fdfa;font-weight:600"' if g == "cross150" else ""
+        rows_html += f"""<tr{hl}>
+<td>{label_map.get(g,g)}</td>
+<td class="num">{s20.get('n',0)}</td>
+<td class="num">{s20.get('win',0)}%</td>
+<td class="num" style="font-weight:700;color:{'#dc2626' if s20.get('avg',0)>0 else '#16a34a'}">{s20.get('avg',0):+.2f}%</td>
+<td class="num">{s20.get('med',0):+.2f}%</td>
+<td class="num">{b.get('win',0)}% / {b.get('avg',0):+.1f}%</td>
+<td class="num">{bl.get('win',0)}% / {bl.get('avg',0):+.1f}%</td>
+</tr>"""
+    period = qr_backtest.get("period", ["", ""])
+    stages = qr_backtest.get("stages", {})
+    stage_str = " | ".join(f"{k}:{v.get('win',0)}%/{v.get('avg',0):+.1f}%" for k, v in stages.items()) if stages else ""
+    return f"""<div style="background:#f0fdfa;border:1px solid #99f6e4;border-radius:8px;padding:12px 16px;margin-bottom:10px">
+<h3 style="color:#0f766e;font-size:15px;margin-bottom:8px">回测验证: 质量交叉 vs 纯超跌 vs 全池 ({period[0]}~{period[1]}, 180交易日)</h3>
+<div class="table-wrap" style="border:none"><table><thead><tr>
+<th>组</th><th>样本</th><th>20日胜率</th><th>20日均收益</th><th>20日中位</th><th>空头日(胜率/均收益)</th><th>多头日(胜率/均收益)</th>
+</tr></thead><tbody>{rows_html}</tbody></table></div>
+<div style="font-size:11px;color:var(--text-secondary);margin-top:8px">
+* 信号日收盘买入持有20日 | 阶段细分(纯超跌组20日): {stage_str} | 注意: 5日持有无优势(45-49%), 本策略需20日耐心 | 均值被右尾拉高, 以中位数辅助判断 | 存活偏差与信号自相关同引擎回测口径
+</div>
+</div>"""
+
+
+def build_html(rankings, extra_info, history, trades, return_data, date_str, freshness, backtest_summary=None, best_strat=None, mkt_overview=None, today_signals=None, signal_history=None, qr_backtest=None):
     n_total = len(rankings)
     n_consensus = sum(1 for r in rankings if r["consensus"])
 
@@ -1829,7 +1868,13 @@ def build_html(rankings, extra_info, history, trades, return_data, date_str, fre
     # 超跌反弹面板行 (第四体系)
     rebound_valid = [r for r in rankings if r.get("rebound_valid")]
     rebound_valid.sort(key=lambda x: x.get("rebound_score", 0), reverse=True)
-    rebound_rows = _build_rebound_rows(rebound_valid, extra_info)
+
+    # 第五视图: 质量反弹 (超跌反弹 ∩ ISIR/GLM前QR_THRESHOLD)
+    qr_list = [r for r in rankings if r.get("rebound_valid")
+               and min(r.get("isir_rank", 9999), r.get("glm_rank", 9999)) <= QR_THRESHOLD]
+    qr_list.sort(key=lambda x: x.get("rebound_score", 0), reverse=True)
+    qrebound_rows = _build_qrebound_rows(qr_list, extra_info)
+    qrebound_bt_html = _build_qrebound_backtest_html(qr_backtest)
 
     # Sector view rows
     sector_groups = defaultdict(list)
@@ -1924,7 +1969,7 @@ def build_html(rankings, extra_info, history, trades, return_data, date_str, fre
     all_tabs.append(("sector","板块",""))
     all_tabs.append(("signals","操作记录",""))
     all_tabs.append(("ss","SS分",""))
-    all_tabs.append(("rebound","超跌反弹",' style="color:#dc2626"'))
+    all_tabs.append(("qrebound","质量反弹",' style="color:#0d9488"'))
 
     tab_btns = ""
     for i, (tid, label, extra_style) in enumerate(all_tabs):
@@ -2014,7 +2059,7 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 .sector-bar-val{{font-weight:600;min-width:50px}}
 @media(max-width:768px){{.dashboard{{grid-template-columns:repeat(3,1fr)}}.detail-grid{{grid-template-columns:1fr}}.mo-grid{{grid-template-columns:repeat(2,1fr)}}}}
 </style></head><body><div class="container">
-<div class="header"><h1>统一评分决策日报 v3.3</h1><div class="meta">日期:{date_str} | 股票池:{n_total}只 | K线:{freshness.get('kline_latest','-')} | 行情:{freshness.get('extra_latest','-')}</div></div>
+<div class="header"><h1>统一评分决策日报 v3.5</h1><div class="meta">日期:{date_str} | 股票池:{n_total}只 | K线:{freshness.get('kline_latest','-')} | 行情:{freshness.get('extra_latest','-')}</div></div>
 
 <!-- 市场全景解读面板 -->
 {_build_market_overview(mkt_overview, rankings, extra_info, n_consensus, n_total, TOP_N, bt_html if backtest_summary else "", consensus_html)}
@@ -2072,26 +2117,32 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 <!-- 历史操作建议记录面板 -->
 {_build_signal_history(signal_history, trades)}
 
-<!-- 超跌反弹面板 (第四体系，独立标记) -->
-<div class="panel" id="panel-rebound">
+<!-- 第五视图: 质量反弹面板 (超跌反弹 × 三体系认可度交叉; 用户2026-09-14决定替代第四体系独立展示) -->
+<div class="panel" id="panel-qrebound">
 <div class="filter-bar">
-<label>板块:</label><select onchange="filterPanel('rebound')" id="sector-rebound"><option value="all">全部</option>{sector_options}</select>
-<label>搜索:</label><input type="text" id="search-rebound" placeholder="代码/名称" oninput="filterPanel('rebound')" style="width:120px">
-<small style="color:#dc2626;margin-left:auto">超跌反弹趋势选股 v2.0 | 超跌30+反弹35+趋势20+风控15 | ATR动态止损</small>
+<label>板块:</label><select onchange="filterPanel('qrebound')" id="sector-qrebound"><option value="all">全部</option>{sector_options}</select>
+<label>搜索:</label><input type="text" id="search-qrebound" placeholder="代码/名称" oninput="filterPanel('qrebound')" style="width:120px">
+<small style="color:#0d9488;margin-left:auto">质量反弹 = 超跌反弹 ∩ ISIR/GLM前{QR_THRESHOLD}名 | 跌得深 且 质地未坏</small>
 </div>
-<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:12px;color:#991b1b">
-<strong>超跌反弹体系说明:</strong> 独立于三体系(ISIR/GLM/SS)的逆向策略维度。三体系找"今天最强的"（顺势），超跌反弹找"跌狠了最可能反弹的"（逆向）。
-<span style="color:#6b7280">阶段: 初现(超跌未确认) → 确认(趋势反转) → 加速(反弹确立)。不参与三体系共识，独立标记。</span>
+<div style="background:#ecfdf5;border:1px solid #99f6e4;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:12px;color:#065f46">
+<strong>第五视图·质量反弹:</strong> 第四体系(超跌反弹)不看质量的缺陷修正——纯超跌名单常被弱势股污染(深跌的多数是基本面走坏者)。
+本视图做交叉过滤: 超跌反弹有效 <strong>且</strong> ISIR或GLM排名前{QR_THRESHOLD}(三体系认可质地未坏), 定位"错杀的好票"。
+<span style="color:#6b7280">逻辑: 均值回归(错杀修复), 与三体系的动量延续方向相反, 与第四体系互补。适用: 事件冲击后的科技链/板块错杀。</span>
 </div>
-<div class="table-wrap"><table><thead><tr>
-<th>#</th><th>代码</th><th>名称</th><th>现价</th><th>5日</th><th>RSI</th><th>超跌分↓</th><th>超跌</th><th>反弹</th><th>趋势</th><th>风控</th><th>阶段</th><th>ATR止损</th><th>止盈</th><th>三体系</th>
-</tr></thead><tbody id="body-rebound">{rebound_rows}</tbody></table></div></div>
+<div style="margin-bottom:10px"><div class="dash-card" style="text-align:left;padding:14px 18px">
+<div style="font-size:13px;font-weight:700;color:#0d9488">今日质量反弹标的: {len(qr_list)}只 (超跌反弹{len(rebound_valid)}只 × 三体系认可, 交集{len(qr_list)}只)</div>
+</div></div>
+<div style="margin:-6px 0 12px 0">{qrebound_bt_html}</div>
+<div class="table-wrap" style="margin-bottom:12px"><table><thead><tr>
+<th>#</th><th>代码</th><th>名称/板块</th><th>现价</th><th>5日</th><th>RSI</th><th>超跌分↓</th><th>阶段</th><th>ISIR</th><th>GLM</th><th>最好</th><th>ATR止损价</th><th>反弹目标</th><th>三体系</th>
+</tr></thead><tbody id="body-qrebound">{qrebound_rows}</tbody></table></div>
+</div>
 
 <div class="panel" id="panel-sector"><div class="section-title">按板块纵览</div>
 {sector_html}</div>
 
-<div class="footer"><p>统一评分引擎 v3.3 | 数据:腾讯财经 | 生成于 {timestr}</p>
-<p style="margin-top:3px;font-size:11px">ISIR=33因子ICIR原始加权 | GLM=mfi/pct_52w方向反转 | SS分=传统技术评分(独立) | 超跌反弹=逆向策略维度(独立标记) | 共识=ISIR∩GLM∩SS分排名 | 点击行展开因子明细 | 每策略含交易账本</p></div></div>
+<div class="footer"><p>统一评分引擎 v3.5 | 数据:腾讯财经 | 生成于 {timestr}</p>
+<p style="margin-top:3px;font-size:11px">ISIR=33因子ICIR原始加权 | GLM=mfi/pct_52w方向反转 | SS分=传统技术评分(独立) | 质量反弹=超跌反弹∩ISIR/GLM前150(第五视图,2026-09-14起替代第四体系独立展示) | 共识=ISIR∩GLM∩SS分排名 | 点击行展开因子明细 | 每策略含交易账本</p></div></div>
 <script>
 function switchTab(n){{document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');[...document.querySelectorAll('.tab-btn')].find(b=>b.textContent.includes(n=='overview'?'纵览':n=='sector'?'板块':n.toUpperCase())||b.onclick.toString().includes("'"+n+"'"))?.classList.add('active')}}
 function toggleRow(id){{var r=document.getElementById(id);if(r)r.style.display=r.style.display==='none'?'table-row':'none'}}
@@ -2106,9 +2157,9 @@ function toggleSector(s){{var b=document.getElementById('sec-'+s)?.querySelector
 
 def main():
     print("="*60)
-    print("  统一评分引擎 v3.3")
-    print("  ISIR | GLM | SS分排名 | 超跌反弹 + 信号追踪 + 双层门控")
-    print("  ICIR重标定 + VCP形态 + 外围市场门控 + 超跌反弹趋势")
+    print("  统一评分引擎 v3.5")
+    print("  ISIR | GLM | SS分排名 | 质量反弹(第五视图,替代第四体系展示) + 信号追踪")
+    print("  ICIR重标定 + VCP形态 + 外围市场门控 + 超跌反弹趋势(作第五视图输入)")
     print("="*60)
 
     if not os.path.exists(STOCK_CODES_FILE):
@@ -2154,6 +2205,18 @@ def main():
     print(f"\n  [超跌反弹] 扫描超跌反弹趋势信号...")
     n_rebound = compute_rebound_scores(rankings, klines, extra_info)
     print(f"  超跌反弹有效: {n_rebound}只 (超跌分≥5+总分≥20)")
+
+    # 第五视图: 质量反弹 (超跌反弹 ∩ ISIR/GLM前QR_THRESHOLD, 定位错杀好票)
+    qr_list = [r for r in rankings if r.get("rebound_valid")
+               and min(r.get("isir_rank", 9999), r.get("glm_rank", 9999)) <= QR_THRESHOLD]
+    qr_list.sort(key=lambda x: x.get("rebound_score", 0), reverse=True)
+    print(f"  [质量反弹] 第五视图: {len(qr_list)}只 (超跌反弹{n_rebound}只 ∩ ISIR/GLM前{QR_THRESHOLD}名)")
+    qr_backtest = None
+    if os.path.exists(QR_BACKTEST_FILE):
+        try:
+            with open(QR_BACKTEST_FILE) as f: qr_backtest = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
 
     # 市场趋势门控
     print(f"\n  [市场趋势门控] 获取上证综指...")
@@ -2213,7 +2276,7 @@ def main():
     n_vcp_breakout = sum(1 for r in rankings if r.get("vcp_status") == "突破")
     n_vcp_pre = sum(1 for r in rankings if r.get("vcp_status") == "预突破")
     print(f"  VCP: 突破{n_vcp_breakout}只 | 预突破{n_vcp_pre}只")
-    html = build_html(rankings, extra_info, history, trades, return_data, date_str, freshness, bt_summary, best_strat, mkt_overview, today_signals, signal_history)
+    html = build_html(rankings, extra_info, history, trades, return_data, date_str, freshness, bt_summary, best_strat, mkt_overview, today_signals, signal_history, qr_backtest)
     html_path = os.path.join(OUTPUT_DIR, f"unified_{date_str}.html")
     with open(html_path, "w", encoding="utf-8") as f: f.write(html)
 
@@ -2235,14 +2298,14 @@ def main():
             rb_tag = f" 超跌{r.get('rebound_stage','')}" if r.get("rebound_valid") else ""
             print(f"     {i}. {r['code']} {name} | ISIR#{r['isir_rank']} GLM#{r['glm_rank']} SS分排名#{r['doubao_rank']}{vcp_tag}{rb_tag}")
     if rebound_list:
-        print(f"  超跌反弹标的({len(rebound_list)}只):")
-        for i,r in enumerate(rebound_list[:5],1):
+        print(f"  超跌反弹标的(第四体系,仅作第五视图输入): {len(rebound_list)}只")
+    if qr_list:
+        print(f"  质量反弹标的·第五视图({len(qr_list)}只):")
+        for i,r in enumerate(qr_list[:5],1):
             name = extra_info.get(r["code"],{}).get("name","")
-            ind = r.get("rebound_indicators",{})
             atr = r.get("rebound_atr",{})
-            print(f"     {i}. {r['code']} {name} | 超跌分{r['rebound_score']:.0f} "
-                  f"(超跌{r['rebound_oversold']}/反弹{r['rebound_signal']}/趋势{r['rebound_trend']}) "
-                  f"[{r['rebound_stage']}] 5日{ind.get('ret_5d',0):+.1f}% 止损{atr.get('stop_loss',0):.1f}%")
+            print(f"     {i}. {r['code']} {name} | 超跌分{r['rebound_score']:.0f}[{r['rebound_stage']}] "
+                  f"ISIR#{r['isir_rank']} GLM#{r['glm_rank']} | 止损{atr.get('stop_price',0):.2f} 目标{atr.get('tp_price',0):.2f}")
     print(f"  {'='*60}")
     db.stats()
     return html_path
