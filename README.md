@@ -139,6 +139,39 @@ python3 strategy_backtest.py
 - SQLite（本地数据缓存）
 - 纯标准库（urllib, sqlite3, json, subprocess）
 
+## 换设备迁移指南 (2026-09-15)
+
+代码与关键数据均在 GitHub 仓库（isir-glm-doubau 的 main 分支），更换 PC 后按以下步骤恢复迭代：
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/mimicangel-png/isir-glm-doubau.git
+cd isir-glm-doubau
+
+# 2. 生成 output 目录（git 不跟踪目录本身）
+mkdir -p output
+
+# 3. 运行引擎 —— K线缓存(output/stock_cache.db)会自动增量抓取重建,
+#    首次约 3-5 分钟拉取 458 只 x 300 日
+python3 unified_scoring_engine.py
+```
+
+**Git 跟踪的关键数据（换设备自动随 clone 恢复）**：
+- `output/unified_signal_history.json` — 信号追踪历史（三体系持仓/已结算交易/累积收益）
+- `output/quality_rebound_backtest.json` — 第五视图质量反弹回测数据
+
+**仅存在于本地、需手动迁移（可选）**：
+- `output/stock_cache.db` (~35MB) — K线缓存。不迁移也行，引擎会自动重拉；迁移可省首跑时间（U盘/网盘/AirDrop 拷贝到 output/ 下即可）
+
+**本地独有的配置（不在 Git，需手动迁移）**：
+- WorkBuddy 自动化任务（盘前9点/午盘12点/收盘16点/资金流16:35）在新设备 WorkBuddy 里重新创建
+- `.workbuddy/memory/` 项目记忆（持仓清单、分析约定）——建议迁移以保持分析连续性
+
+**股票池调整注意事项**（重要踩坑记录）：
+1. 新代码加入 `stock_codes.txt` 后，需删除 `output/stock_cache.db` 中该代码的 klines/extra_info/fund_flows 记录（或直接删整个db），引擎才会增量抓取新标的
+2. 沪市 ETF（588/589 开头）前缀已由 stock_db.py 的 `_to_symbol` 处理（2026-09-15 修复），深市 ETF（159 开头）走默认 sz 分支
+3. 新标的需同步在 `sector_map.py` 的 STOCK_SECTOR 补板块映射，否则行业相对因子（sector_rsi/sector_momentum）失真
+
 ## 免责声明
 
 本项目仅供学习和研究使用，不构成投资建议。投资有风险，入市需谨慎。

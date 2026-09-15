@@ -1,7 +1,11 @@
-# output目录
-output/
+# output目录(仅忽略生成物, 保留需跨设备迁移的关键数据)
+output/*
+!output/unified_signal_history.json
+!output/quality_rebound_backtest.json
 *.db
 *.json
+!unified_signal_history.json
+!quality_rebound_backtest.json
 
 # Python
 __pycache__/
