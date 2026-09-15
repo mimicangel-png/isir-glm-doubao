@@ -141,7 +141,7 @@ python3 strategy_backtest.py
 
 ## 换设备迁移指南 (2026-09-15)
 
-代码与关键数据均在 GitHub 仓库（isir-glm-doubau 的 main 分支），更换 PC 后按以下步骤恢复迭代：
+代码与关键数据均在 GitHub 仓库（isir-glm-doubau 的 main 分支，**已转私有**），更换 PC 后按以下步骤恢复迭代：
 
 ```bash
 # 1. 克隆仓库
@@ -159,13 +159,13 @@ python3 unified_scoring_engine.py
 **Git 跟踪的关键数据（换设备自动随 clone 恢复）**：
 - `output/unified_signal_history.json` — 信号追踪历史（三体系持仓/已结算交易/累积收益）
 - `output/quality_rebound_backtest.json` — 第五视图质量反弹回测数据
+- `.workbuddy/` — 完整项目记忆（用户真实持仓与成本、分析方法论约束、每日工作日志、自动化任务执行记录、体系架构决策史）。仓库已转私有，2026-09-15 起纳入跟踪
 
 **仅存在于本地、需手动迁移（可选）**：
 - `output/stock_cache.db` (~35MB) — K线缓存。不迁移也行，引擎会自动重拉；迁移可省首跑时间（U盘/网盘/AirDrop 拷贝到 output/ 下即可）
 
 **本地独有的配置（不在 Git，需手动迁移）**：
-- WorkBuddy 自动化任务（盘前9点/午盘12点/收盘16点/资金流16:35）在新设备 WorkBuddy 里重新创建
-- `.workbuddy/memory/` 项目记忆（持仓清单、分析约定）——建议迁移以保持分析连续性
+- WorkBuddy 自动化任务（盘前9点/午盘12点/收盘16点/资金流16:35）在新设备 WorkBuddy 里重新创建（执行历史已随 `.workbuddy/` 入 Git，仅任务定义需重建）
 
 **股票池调整注意事项**（重要踩坑记录）：
 1. 新代码加入 `stock_codes.txt` 后，需删除 `output/stock_cache.db` 中该代码的 klines/extra_info/fund_flows 记录（或直接删整个db），引擎才会增量抓取新标的
