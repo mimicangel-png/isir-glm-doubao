@@ -90,7 +90,7 @@ class StockDB:
     def _to_symbol(code):
         if code.startswith(("8", "4", "920")):
             return f"bj{code}"
-        return f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}"
+        return f"sh{code}" if code.startswith(("6", "9", "58")) else f"sz{code}"
 
     def get_klines(self, codes, days=130):
         today = datetime.now().strftime("%Y-%m-%d")
@@ -315,7 +315,7 @@ class StockDB:
     @staticmethod
     def _get_eastmoney_secid(code):
         """获取东方财富secid格式: 1.600000 / 0.000001 / 0.300001"""
-        if code.startswith(("6", "9")):
+        if code.startswith(("6", "9", "58")):
             return f"1.{code}"
         elif code.startswith(("8", "4", "920")):
             return f"0.{code}"  # 北交所
