@@ -1,0 +1,51 @@
+#!/bin/bash
+# ============================================================
+# run_focus.sh - 每日评分 + 重点科技股走势追踪
+# 对齐线上 GitHub Actions 机制：跑统一评分引擎 + 输出重点标的摘要
+# 重点监控: 福晶科技(002222) 东田微(301183) 飞龙股份(002536)
+#           金刚光伏(300093) 亚振家居(603389) 特变电工(600089)
+#           生益电子(688183) 中际旭创(300308) 麦格米特(002851) 采纳股份(301122)
+#           南大光电(300346) 深南电路(002916) 紫光股份(000938) 华是科技(301218)
+# 用法: bash run_focus.sh [--no-engine]  (--no-engine 跳过引擎只出摘要)
+# 每次运行后自动按"日期_时段"独立存档，不覆盖历史:
+#   output/unified_YYYY-MM-DD.html          <- 最新一份(canonical)
+#   output/unified_YYYY-MM-DD_HHMM.html     <- 本次时段独立存档
+# ============================================================
+set -e
+cd "$(dirname "$0")"
+PY=/Users/bytedance/.workbuddy/binaries/python/envs/default/bin/python
+
+TODAY=$(date +%F)
+SLOT=$(date +%H%M)
+
+if [ "$1" != "--no-engine" ]; then
+  echo "========== [1/3] 运行统一评分引擎 =========="
+  $PY unified_scoring_engine.py 2>&1 | tail -30
+else
+  echo "========== [1/3] 跳过引擎(使用已有数据) =========="
+fi
+
+echo ""
+echo "========== [2/3] 时段独立存档 (${TODAY}_${SLOT}) =========="
+ARCHIVED=""
+for ext in html json; do
+  SRC="output/unified_${TODAY}.${ext}"
+  DST="output/unified_${TODAY}_${SLOT}.${ext}"
+  if [ -f "$SRC" ]; then
+    cp "$SRC" "$DST"
+    echo "  ✅ ${DST}  (from ${SRC})"
+    ARCHIVED="$ARCHIVED $DST"
+  else
+    echo "  ⚠ 未找到 ${SRC}，跳过存档"
+  fi
+done
+if [ -z "$ARCHIVED" ]; then
+  echo "  ⚠ 本次没有可存档的报告文件——引擎可能失败，检查上方输出"
+fi
+
+echo ""
+echo "========== [3/3] 重点科技股走势追踪 =========="
+$PY focus_summary.py
+
+echo ""
+echo "✅ 完成 | 存档: ${TODAY}_${SLOT}"

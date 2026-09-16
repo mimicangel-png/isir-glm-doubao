@@ -92,7 +92,10 @@ class StockDB:
             return f"bj{code}"
         return f"sh{code}" if code.startswith(("6", "9", "58")) else f"sz{code}"
 
-    def get_klines(self, codes, days=130):
+    def get_klines(self, codes, days=130, refresh_today=True):
+        """refresh_today=True: 当日K线即使已缓存也强制重抓(修复盘中快照滞留问题,
+        确保收盘后运行能拿到最终收盘价; 抓取失败时回退用缓存值)
+        (2026-09-16 本地合并: 从本地v3.3移植到远端v3.5基线, 适配盘中三时段自动化)"""
         today = datetime.now().strftime("%Y-%m-%d")
         all_klines = {}
         missing = []
@@ -113,6 +116,9 @@ class StockDB:
                     parsed = [{"date":r[0],"open":r[1],"high":r[2],"low":r[3],"close":r[4],"volume":r[5]} for r in rows]
                     if last_date >= latest_td:
                         all_klines[code] = parsed[-days:]
+                        if refresh_today:
+                            # 当日K线可能为盘中快照, 强制重抓以获取最新/收盘价
+                            missing.append(code)
                     else:
                         all_klines[code] = parsed
                         missing.append(code)
