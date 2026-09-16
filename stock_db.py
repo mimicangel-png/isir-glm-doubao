@@ -146,32 +146,66 @@ class StockDB:
                 resp = urllib.request.urlopen(req, timeout=10)
                 data = json.loads(resp.read().decode("utf-8"))
                 klines = data.get("data",{}).get(sym,{}).get("qfqday",[]) or data.get("data",{}).get(sym,{}).get("day",[])
-                return code, klines, None
+                return code, klines, None, "tencent"
             except Exception as e:
-                return code, None, str(e)[:200]
+                # 腾讯失败(如WAF限流501) → 新浪备用通道
+                fb = self._fetch_sina_kline(code, sym, days)
+                if fb is not None:
+                    return code, fb, None, "sina"
+                return code, None, str(e)[:200], "tencent"
 
         completed = 0
         with ThreadPoolExecutor(max_workers=self._workers) as ex:
             futures = {ex.submit(fetch_one, c): c for c in codes}
             for f in as_completed(futures):
-                code, kls, err = f.result()
+                code, kls, err, src = f.result()
                 completed += 1
                 if completed % 30 == 0: print(f"  K线: {completed}/{len(codes)}")
                 if kls:
-                    parsed = []
-                    for k in kls:
-                        try:
-                            parsed.append({"date":k[0],"open":float(k[1]),"close":float(k[2]),"high":float(k[3]),"low":float(k[4]),"volume":float(k[5]) if len(k)>5 else 0})
-                        except (IndexError, ValueError, TypeError):
-                            continue
+                    if src == "sina":
+                        # 新浪返回 [{day,open,high,low,close,volume(股)}] → 腾讯兼容口径(手)
+                        parsed = []
+                        for k in kls:
+                            try:
+                                parsed.append({"date": k["day"][:10], "open": float(k["open"]), "close": float(k["close"]),
+                                               "high": float(k["high"]), "low": float(k["low"]), "volume": float(k.get("volume", 0)) / 100.0})
+                            except (KeyError, ValueError, TypeError):
+                                continue
+                    else:
+                        parsed = []
+                        for k in kls:
+                            try:
+                                parsed.append({"date":k[0],"open":float(k[1]),"close":float(k[2]),"high":float(k[3]),"low":float(k[4]),"volume":float(k[5]) if len(k)>5 else 0})
+                            except (IndexError, ValueError, TypeError):
+                                continue
                     if parsed:
                         existing = {r["date"]:r for r in all_klines.get(code,[])}
                         for r in parsed: existing[r["date"]] = r
                         all_klines[code] = sorted(existing.values(), key=lambda x:x["date"])
                         self._save_klines(code, parsed)
-                        self._log_fetch(code, today, "klines", "ok")
+                        self._log_fetch(code, today, "klines", f"ok_{src}")
                 else:
                     self._log_fetch(code, today, "klines", "failed", err)
+
+    def _fetch_sina_kline(self, code, sym, days):
+        """新浪日K备用通道(2026-09-16新增): 腾讯fqkline被WAF限流时的自动降级。
+        返回新浪原始列表[{day,open,high,low,close,volume(股)}] 或 None。
+        注意: ① 不复权价(该接口无复权参数, 适合近期无除权的标的; 有除权时会引入口径污染,
+        好在下次腾讯通道恢复后会以qfq覆盖) ② 盘中当日bar可能缺失, 收盘后才有。"""
+        url = (f"https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_foo=/"
+               f"CN_MarketDataService.getKLineData?symbol={sym}&scale=240&ma=no&datalen={days}")
+        req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0", "Referer":"https://finance.sina.com.cn"})
+        try:
+            resp = urllib.request.urlopen(req, timeout=10)
+            text = resp.read().decode("utf-8")
+            # jsonp_v2包装: var _foo=(...) → 提取JSON数组部分
+            start = text.find("[")
+            end = text.rfind("]")
+            if start < 0 or end <= start:
+                return None
+            return json.loads(text[start:end+1])
+        except Exception:
+            return None
 
     def _save_klines(self, code, klines):
         with self._connect() as conn:
