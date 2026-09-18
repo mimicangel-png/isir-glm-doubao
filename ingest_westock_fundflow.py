@@ -5,14 +5,20 @@ westock(腾讯自选股)实时资金流入库脚本 — 盘中实时数据通道
       本脚本解析写入stock_cache.db的fund_flows表, 统一评分引擎随即读到当日实时资金流因子。
       解决: SS分资金面55%权重盘中读昨日数据导致的排名滞后(如涨停当日豆包排名卡壳)。
 
-输入文件: output/fundflow_westock.json
-格式(-westock data_fund_flow逐次调用结果的合并, 每个元素为一次调用的data map):
+输入文件: output/fundflow_westock.json 或 output/fundflow_westock.txt
+格式A(-westock data_fund_flow逐次调用结果的合并, 每个元素为一次调用的data map):
 [
   {"sz002222": {"code":"sz002222","data":[{"SecuCode":"sz002222","EndDate":"2026-09-16",
      "MainNetFlow":"228890151","MainNetFlow5D":"-212006230","MainNetFlow20D":"-446310553",
      "JumboNetFlow":"278145186","MainInflowCircRate":"0.71","ClosePrice":"69.13", ...}]}, ...},
   ...  # 多次调用合并成一个数组
 ]
+
+格式B(紧凑行格式, 2026-09-17新增——AI转录量减70%, 推荐):
+  每行一只: code|MainNetFlow|MainNetFlow5D|MainNetFlow20D|JumboNetFlow|MainInflowCircRate
+  code 可带 sz/sh 前缀(自动取后6位), 日期取当天。
+  例: sz002222|-171225913|-37837104|-34321026|-162956354|0.53
+  # 空行与 # 开头行忽略
 
 字段映射(与fund_flows表口径一致):
   MainNetFlow     -> main_net_today  (当日实时主力净流入, 元)
@@ -26,6 +32,7 @@ westock(腾讯自选股)实时资金流入库脚本 — 盘中实时数据通道
 """
 
 import os, sys, json, sqlite3
+from datetime import datetime
 
 SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SELF_DIR, "output", "stock_cache.db")
@@ -45,28 +52,52 @@ def _clean_code(secucode):
 
 
 def ingest(raw_path=DEFAULT_RAW):
-    with open(raw_path, "r", encoding="utf-8") as f:
-        batches = json.load(f)
-
+    today_str = datetime.now().strftime("%Y-%m-%d")
     records = {}
-    for batch in batches:
-        if not isinstance(batch, dict):
-            continue
-        for key, node in batch.items():
-            rows = (node or {}).get("data") or []
-            for r in rows:
-                date = str(r.get("EndDate", ""))[:10]
-                code = _clean_code(r.get("SecuCode") or key)
-                if not date or not code:
-                    continue
-                # 同日多次拉取以最新为准(后写覆盖)
-                records[(code, date)] = {
-                    "main_net_5d": _f(r.get("MainNetFlow5D")),
-                    "main_net_20d": _f(r.get("MainNetFlow20D")),
-                    "inflow_rate": _f(r.get("MainInflowCircRate")),
-                    "jumbo_net": _f(r.get("JumboNetFlow")),
-                    "main_net_today": _f(r.get("MainNetFlow")),
-                }
+
+    with open(raw_path, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+
+    if content.startswith("["):
+        # 格式A: JSON数组
+        batches = json.loads(content)
+        for batch in batches:
+            if not isinstance(batch, dict):
+                continue
+            for key, node in batch.items():
+                rows = (node or {}).get("data") or []
+                for r in rows:
+                    date = str(r.get("EndDate", ""))[:10]
+                    code = _clean_code(r.get("SecuCode") or key)
+                    if not date or not code:
+                        continue
+                    # 同日多次拉取以最新为准(后写覆盖)
+                    records[(code, date)] = {
+                        "main_net_5d": _f(r.get("MainNetFlow5D")),
+                        "main_net_20d": _f(r.get("MainNetFlow20D")),
+                        "inflow_rate": _f(r.get("MainInflowCircRate")),
+                        "jumbo_net": _f(r.get("JumboNetFlow")),
+                        "main_net_today": _f(r.get("MainNetFlow")),
+                    }
+    else:
+        # 格式B: 紧凑行 code|MainNetFlow|MainNetFlow5D|MainNetFlow20D|JumboNetFlow|MainInflowCircRate
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) < 6:
+                continue
+            code = _clean_code(parts[0])
+            if not code:
+                continue
+            records[(code, today_str)] = {
+                "main_net_today": _f(parts[1]),
+                "main_net_5d": _f(parts[2]),
+                "main_net_20d": _f(parts[3]),
+                "jumbo_net": _f(parts[4]),
+                "inflow_rate": _f(parts[5]),
+            }
 
     if not records:
         print("无有效数据可入库")
@@ -100,8 +131,12 @@ def ingest(raw_path=DEFAULT_RAW):
 
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_RAW
-    if not os.path.exists(path):
-        print(f"输入文件不存在: {path}")
+    candidates = [sys.argv[1]] if len(sys.argv) > 1 else [
+        os.path.join(SELF_DIR, "output", "fundflow_westock.json"),
+        os.path.join(SELF_DIR, "output", "fundflow_westock.txt"),
+    ]
+    path = next((p for p in candidates if os.path.exists(p)), None)
+    if path is None:
+        print(f"输入文件不存在: {candidates[0]}")
         sys.exit(1)
     ingest(path)

@@ -20,7 +20,11 @@ SLOT=$(date +%H%M)
 
 if [ "$1" != "--no-engine" ]; then
   echo "========== [1/3] 运行统一评分引擎 =========="
-  $PY unified_scoring_engine.py 2>&1 | tail -30
+  # 完整输出落盘(供自动化/复盘直接读取大盘门控/共识/信号/回测摘要, 免解析HTML), 控制台仅留尾部
+  mkdir -p output/logs
+  LOG="output/logs/engine_${TODAY}_${SLOT}.log"
+  $PY unified_scoring_engine.py 2>&1 | tee "$LOG" | tail -30
+  echo "  📄 引擎完整输出已存: ${LOG}"
 else
   echo "========== [1/3] 跳过引擎(使用已有数据) =========="
 fi
@@ -45,7 +49,8 @@ fi
 
 echo ""
 echo "========== [3/3] 重点科技股走势追踪 =========="
-$PY focus_summary.py
+mkdir -p output/logs
+$PY focus_summary.py 2>&1 | tee "output/logs/focus_${TODAY}_${SLOT}.log"
 
 echo ""
 echo "✅ 完成 | 存档: ${TODAY}_${SLOT}"

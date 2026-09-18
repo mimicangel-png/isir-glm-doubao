@@ -11,6 +11,7 @@
 - **总览**：平安证券**2528+国金证券**7341两账户，市值约497万，总浮亏约-129万(-20.6%)
 - **工作流约定(9/15用户指定)**：每次实时分析，除标准评分外必须对真实持仓做详细解读
 - **盈利**：特变电工600089(+48%,1.82万股,远超+15%止盈线)、富祥股份300497双账户2.59万股(+14.2%,共识ISIR#5/GLM#5/SS#4,VCP突破)
+- **新买(9/17 14时许)**：彤程新材603650 成本74(股数未知)。买入时点当日+5~6%放量突破，共识#13/#14/#9 SS70.2 VCP突破，当日主力+0.71亿/5日+1.86亿。止损纪律-8%→68.1，止盈+15%→85.1
 - **已清仓**：东田微301183(9/16早284卖出,成本275.4口径+3.1%完成解套闭环;卖出后当日冲297)、飞龙股份002536(-3.8%,成本55.75,ISIR#50/GLM#46,质量反弹初现37分,VCP预突破)
 - **⚠️危险**：金刚光伏300093(1.19万股,-12.4%,评分#436/#443池内倒数,超跌初现,逼近ATR止损19.44)
 - **深套+评分末段(风控重点)**：湖南裕能301358(-37%,#430)、奥普光电002338(-31%,#391)、汇川技术300124(-34%,#360,超跌初现42分)、西部材料002149(-55%,SS#430全池倒数,超跌初现44分)、福晶科技002222(两账户8000股,平安成本182/国金85.5,-25%/-65%,评分#209)
@@ -63,9 +64,13 @@
 - ⚠️东田微成本口径待用户确认：本地自动化任务prompt写270，远端MEMORY(9/15截图)记275.4
 - 生益电子688183保留在focus追踪列表（用户2026-09-16明确不移除）
 
-## 实时资金流刷新流程（2026-09-16建立，westock通道）
-- **每次盘中/临时实时分析前必做**：①python3 gen_fundflow_pool.py 取关键池代码串(持仓+focus+共识+双TOP30) ②westock MCP data_fund_flow逐行调用codes ③返回data合并数组写 output/fundflow_westock.json ④python3 ingest_westock_fundflow.py 入库 ⑤再跑 run_focus.sh
-- 12:00午盘/14:30盘尾/15:30收盘后三个自动化prompt已加此第0步(2026-09-16)；9:00盘前不加(当日资金流未产生)
-- 字段映射: MainNetFlow→main_net_today, MainNetFlow5D/20D→main_net_5d/20d, JumboNetFlow→jumbo_net, MainInflowCircRate→inflow_rate
+## 实时资金流刷新流程（2026-09-16建立，2026-09-18 v2混合口径版）
+- **混合口径（用户2026-09-18确认"还是需要实时数据"后的最终架构）：当日净额=westock实时，5D/20D累计=tdx逐日收盘口径拼合**。tdx盘中只到昨收、westock才有当日实时，两者互补非二选一
+- **流程**：①gen_fundflow_pool.py --tdx 取核心池(≈35只)/扩展池(≈20只) ②核心池逐只走 mcp__tdx-connector__tdx_api_data (entry="TdxSharePCCW.tdxf10_gg_jyds" fixedTag="zjlx" code=纯数字)转录紧凑行追加 output/fundflow_tdx.txt：`code|首行日期|首行超大单净买入|d1,...,d20` ③全池westock data_fund_flow批量→紧凑行 output/fundflow_westock.txt（`代码|MainNetFlow|5D|20D|Jumbo|Rate`） ④**入库顺序固定**：先 ingest_westock_fundflow.py（全池今日实时）→ 再 `ingest_tdx_fundflow.py output/fundflow_tdx.txt --merge-westock output/fundflow_westock.txt`（核心池合并覆盖）⑤跑 run_focus.sh
+- **合并逻辑(脚本自动)**：tdx首行日期<今日→当日=westock实时、5D=tdx前4收盘日+今日、20D=tdx前19收盘日+今日、jumbo/rate=westock；tdx首行=今日(收盘后)→纯tdx完整口径不与westock重复计入。已用真实德福数据+临时库断言测试通过
+- 12:00/14:30/15:30三个自动化prompt已用v2混合版(2026-09-18)；9:00盘前不刷新(当日未产生)
+- **失败快速回退**：westock失败→纯tdx入库(当日为昨日口径)；tdx失败→纯westock；双失败跳过直接run_focus.sh注明"昨日口径"。各最多重试1次。9/17曾因连接器卡90分钟
+- **已验证结论（勿再浪费时间探测）**：tdx/westock MCP均无法脚本直连（tdxhub.icfqs.com内部端点拒绝裸调用、txmcp.tdx.com.cn需OAuth、auth.tdx.com.cn token端点无匿名响应）；tdx jyds/zjlx只能逐只查询无批量；westock支持codes批量但会限频(error_type=2)
+- 字段映射: tdx主力净额列→逐日收盘值(脚本求和), 超大单净买入→jumbo_net; westock: MainNetFlow→当日实时, 5D/20D直写, MainInflowCircRate→inflow_rate
 - 持仓清单在 gen_fundflow_pool.py 的 HOLDINGS 常量(东田微已清仓移除)，清仓/新买后手动更新
-- 效果实测(9/16): 东材科技豆包#23→#7 SS64→70(+6.6亿流入即时计入)；westock数据分钟级鲜活(福晶主力排名#49→#47两分钟变化)
+- 2026-09-18股票池459→461：德福科技301511/铜冠铜箔301217入池(sector_map归半导体/芯片, 与PCB链生益/深南/沪电一致)；德福ISIR#18/GLM#18、铜冠#113/#115，均VCP预突破(德福pivot 118.51/铜冠123.97)
