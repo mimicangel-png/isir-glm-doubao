@@ -1632,6 +1632,7 @@ def _build_qrebound_rows(qr_list, extra_info):
         vcp = r.get("vcp_status", "")
         if vcp == "突破": tags += '<span class="tag top-vcp-breakout">VCP突破</span>'
         elif vcp == "预突破": tags += '<span class="tag top-vcp-pre">VCP预突破</span>'
+        if r.get("fund_confirm"): tags += '<span class="tag top-fund">资金确认</span>'
         if not tags: tags = '<span style="color:#ccc;font-size:11px">—</span>'
 
         rows += f"""<tr>
@@ -1732,6 +1733,10 @@ def build_html(rankings, extra_info, history, trades, return_data, date_str, fre
             elif vcp_status == "预突破":
                 vcp_badge = '<span class="tag top-vcp-pre" title="VCP形态形成中,接近pivot">VCP预突破</span>'
             top_tags += vcp_badge
+            # 资金确认标签 (加分项, 与VCP并列)
+            if r.get("fund_confirm"):
+                ff_today = (r.get("fund_today", 0) or 0) / 1e8
+                top_tags += f'<span class="tag top-fund" title="当日主力净流入{ff_today:+.2f}亿且5日累计为正(真实持续流入)">资金确认</span>'
             # 超跌反弹标记 (第四体系)
             if r.get("rebound_valid"):
                 rb_stage = r.get("rebound_stage", "")
@@ -2023,7 +2028,7 @@ tr.row-consensus:hover{{background:#fde68a!important}}
 .badge.sig-hold{{background:#2563eb;color:white;font-size:10px;margin-right:2px}}
 .badge.sig-watch{{background:#d97706;color:white;font-size:10px;margin-right:2px}}
 .tag{{padding:1px 5px;border-radius:4px;font-size:9px;font-weight:600;margin-right:2px}}
-.tag.top-isir{{background:#dbeafe;color:var(--isir-c)}}.tag.top-glm{{background:#ede9fe;color:var(--glm-c)}}.tag.top-doubao{{background:#d1fae5;color:var(--doubao-c)}}.tag.top-vcp-breakout{{background:#fee2e2;color:#dc2626;font-weight:600}}.tag.top-vcp-pre{{background:#fef3c7;color:#d97706}}.tag.top-rebound{{background:#fce7f3;color:#be185d;font-weight:600}}
+.tag.top-isir{{background:#dbeafe;color:var(--isir-c)}}.tag.top-glm{{background:#ede9fe;color:var(--glm-c)}}.tag.top-doubao{{background:#d1fae5;color:var(--doubao-c)}}.tag.top-vcp-breakout{{background:#fee2e2;color:#dc2626;font-weight:600}}.tag.top-vcp-pre{{background:#fef3c7;color:#d97706}}.tag.top-rebound{{background:#fce7f3;color:#be185d;font-weight:600}}.tag.top-fund{{background:#cffafe;color:#0891b2;font-weight:600}}
 .ss-col{{color:var(--primary);font-weight:600;font-size:13px}}
 .section-title{{font-size:18px;font-weight:700;margin:28px 0 12px;color:var(--text)}}
 .detail-row td{{padding:0}}
@@ -2201,6 +2206,17 @@ def main():
             r["vcp_status"] = ""
             r["vcp_info"] = None
 
+    # 资金确认标签 (加分项, 与VCP并列, 不参与共识排名)
+    # 判定: 当日主力净流入>0 且 5日累计净流入>0 (真实持续流入, 避免单日脉冲)
+    # 回测依据: 主力/超大单净流入为弱正向信号(20日+0.8%), 详见 2026-09-21 长历史回测
+    for r in rankings:
+        ff = fund_flows.get(r["code"], {})
+        m_today = ff.get("main_net_today", 0) or 0
+        m_5d = ff.get("main_net_5d", 0) or 0
+        r["fund_confirm"] = bool(m_today > 0 and m_5d > 0)
+        r["fund_today"] = m_today
+        r["fund_5d"] = m_5d
+
     # 超跌反弹评分 (第四体系，独立标记，不参与三体系共识)
     print(f"\n  [超跌反弹] 扫描超跌反弹趋势信号...")
     n_rebound = compute_rebound_scores(rankings, klines, extra_info)
@@ -2275,7 +2291,8 @@ def main():
     print(f"\n  [4/4] 生成报告... 共识TOP{TOP_N}: {n_consensus}只")
     n_vcp_breakout = sum(1 for r in rankings if r.get("vcp_status") == "突破")
     n_vcp_pre = sum(1 for r in rankings if r.get("vcp_status") == "预突破")
-    print(f"  VCP: 突破{n_vcp_breakout}只 | 预突破{n_vcp_pre}只")
+    n_fund_confirm = sum(1 for r in rankings if r.get("fund_confirm"))
+    print(f"  VCP: 突破{n_vcp_breakout}只 | 预突破{n_vcp_pre}只 | 资金确认{n_fund_confirm}只")
     html = build_html(rankings, extra_info, history, trades, return_data, date_str, freshness, bt_summary, best_strat, mkt_overview, today_signals, signal_history, qr_backtest)
     html_path = os.path.join(OUTPUT_DIR, f"unified_{date_str}.html")
     with open(html_path, "w", encoding="utf-8") as f: f.write(html)
@@ -2296,7 +2313,8 @@ def main():
             name = extra_info.get(r["code"],{}).get("name","")
             vcp_tag = f" VCP{r['vcp_status']}" if r.get("vcp_status") else ""
             rb_tag = f" 超跌{r.get('rebound_stage','')}" if r.get("rebound_valid") else ""
-            print(f"     {i}. {r['code']} {name} | ISIR#{r['isir_rank']} GLM#{r['glm_rank']} SS分排名#{r['doubao_rank']}{vcp_tag}{rb_tag}")
+            fund_tag = " 资金确认" if r.get("fund_confirm") else ""
+            print(f"     {i}. {r['code']} {name} | ISIR#{r['isir_rank']} GLM#{r['glm_rank']} SS分排名#{r['doubao_rank']}{vcp_tag}{fund_tag}{rb_tag}")
     if rebound_list:
         print(f"  超跌反弹标的(第四体系,仅作第五视图输入): {len(rebound_list)}只")
     if qr_list:

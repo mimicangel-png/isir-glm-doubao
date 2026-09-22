@@ -4,7 +4,7 @@
 统一数据层：K线、实时行情、资金流、公告事件
 """
 
-import os, json, sqlite3, urllib.request, subprocess, re
+import os, json, sqlite3, urllib.request, subprocess, re, time
 from datetime import datetime, timedelta
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -131,6 +131,13 @@ class StockDB:
         if missing:
             self._fetch_klines_batch(missing, days, today, all_klines)
 
+        # 2026-09-22: 兜底——仍有标的缺当日bar(新浪盘中无当日数据)时用qt实时快照合成
+        if latest_td == today:
+            stale = [c for c in codes
+                     if all_klines.get(c) and all_klines[c][-1]["date"] < today]
+            if stale:
+                self._patch_today_from_qt(stale, today, all_klines)
+
         for code in list(all_klines.keys()):
             if len(all_klines[code]) > days:
                 all_klines[code] = all_klines[code][-days:]
@@ -148,7 +155,10 @@ class StockDB:
                 klines = data.get("data",{}).get(sym,{}).get("qfqday",[]) or data.get("data",{}).get(sym,{}).get("day",[])
                 return code, klines, None, "tencent"
             except Exception as e:
-                # 腾讯失败(如WAF限流501) → 新浪备用通道
+                # 腾讯失败(如WAF限流501) → 东财前复权通道(含当日bar) → 新浪备用
+                em = self._fetch_em_kline(code, days)
+                if em:
+                    return code, em, None, "eastmoney"
                 fb = self._fetch_sina_kline(code, sym, days)
                 if fb is not None:
                     return code, fb, None, "sina"
@@ -180,12 +190,88 @@ class StockDB:
                                 continue
                     if parsed:
                         existing = {r["date"]:r for r in all_klines.get(code,[])}
-                        for r in parsed: existing[r["date"]] = r
+                        # 2026-09-22: 新浪为不复权口径, 只允许补缺口(不覆盖腾讯/东财前复权数据), 防口径混用
+                        if src == "sina":
+                            new_rows = [r for r in parsed if r["date"] not in existing]
+                            for r in parsed:
+                                existing.setdefault(r["date"], r)
+                        else:
+                            new_rows = parsed
+                            for r in parsed:
+                                existing[r["date"]] = r
+                        if not new_rows:
+                            self._log_fetch(code, today, "klines", f"skip_{src}")
+                            continue
                         all_klines[code] = sorted(existing.values(), key=lambda x:x["date"])
-                        self._save_klines(code, parsed)
+                        self._save_klines(code, new_rows)
                         self._log_fetch(code, today, "klines", f"ok_{src}")
                 else:
                     self._log_fetch(code, today, "klines", "failed", err)
+
+    def _fetch_em_kline(self, code, days):
+        """东财前复权日K备用通道(2026-09-22新增, 优先级高于新浪):
+        腾讯fqkline被WAF限流时的首选降级。返回腾讯兼容口径
+        [[date, open, close, high, low, volume(手)], ...] 或 None。
+        优势: fqt=1真前复权(与腾讯qfq同口径)且**含当日盘中bar**; 新浪则不复权且盘中无当日bar。"""
+        secid = ("1." if code.startswith(("6", "5", "9")) else "0.") + code
+        url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=" + secid +
+               "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=1&end=20500101&lmt=" + str(days + 10))
+        try:
+            resp = urllib.request.urlopen(urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0"}), timeout=10)
+            data = json.loads(resp.read().decode("utf-8"))
+            rows = (data.get("data") or {}).get("klines") or []
+            out = []
+            for r in rows:
+                p = r.split(",")
+                if len(p) < 6:
+                    continue
+                # 东财: date,open,close,high,low,volume(手)
+                out.append([p[0], p[1], p[2], p[3], p[4], p[5]])
+            return out or None
+        except Exception:
+            return None
+
+    def _patch_today_from_qt(self, codes, today, all_klines):
+        """qt.gtimg.cn 实时快照合成当日K线(2026-09-22新增):
+        腾讯+东财均失败时, 新浪通道盘中不含当日bar → 用实时快照补当日bar,
+        保证盘中运行的因子计算不落在昨日收盘上。仅当快照时间戳为今日才写入(防非交易日/停牌造伪bar)。"""
+        ymd = today.replace("-", "")
+        patched = 0
+        for i in range(0, len(codes), 20):
+            chunk = codes[i:i+20]
+            syms = ",".join(self._to_symbol(c) for c in chunk)
+            try:
+                raw = urllib.request.urlopen(urllib.request.Request(
+                    "https://qt.gtimg.cn/q=" + syms, headers={"User-Agent": "Mozilla/5.0"}), timeout=10).read().decode("gbk", "ignore")
+            except Exception:
+                break
+            for line in raw.strip().split(";"):
+                p = line.strip().split("~")
+                if len(p) < 35:
+                    continue
+                c, ts = p[2], p[30]
+                if not c or not ts.startswith(ymd):
+                    continue
+                try:
+                    bar = {"date": today, "open": float(p[5]), "high": float(p[33]),
+                           "low": float(p[34]), "close": float(p[3]), "volume": float(p[6])}
+                except (ValueError, IndexError):
+                    continue
+                if bar["close"] <= 0 or bar["open"] <= 0:
+                    continue
+                existing = {r["date"]: r for r in all_klines.get(c, [])}
+                if len(existing) < 20:      # 历史太短, 补一根也凑不出因子
+                    continue
+                existing[today] = bar
+                all_klines[c] = sorted(existing.values(), key=lambda x: x["date"])
+                self._save_klines(c, [bar])
+                self._log_fetch(c, today, "klines", "ok_qt")
+                patched += 1
+            time.sleep(0.2)
+        if patched:
+            print(f"  [DB] qt实时快照补当日K线: {patched}只")
+        return patched
 
     def _fetch_sina_kline(self, code, sym, days):
         """新浪日K备用通道(2026-09-16新增): 腾讯fqkline被WAF限流时的自动降级。

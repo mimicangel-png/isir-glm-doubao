@@ -17,6 +17,18 @@ PY=/Users/bytedance/.workbuddy/binaries/python/envs/default/bin/python
 
 TODAY=$(date +%F)
 SLOT=$(date +%H%M)
+HOUR=$(date +%H)
+
+# ===== 实时资金流刷新 (2026-09-21新增) =====
+# 盘中(HOUR>=9:30)自动拉 westock 当日实时资金流入库, 解决SS分资金面盘中读昨收滞后问题。
+# 盘前(9:00前, 未开盘无实时资金流)跳过; 午盘/收盘/手动盘中均刷实时。
+# --no-fundflow 跳过(手动降级); 拉取失败不中断引擎(引擎回退读昨收)。
+if [ "$1" != "--no-fundflow" ] && [ "${HOUR#0}" -ge 9 ]; then
+  echo "========== [0/3] 刷新盘中实时资金流 (westock) =========="
+  $PY refresh_fundflow_realtime.py 2>&1 | tail -8
+else
+  echo "========== [0/3] 跳过实时资金流 (盘前/手动降级) =========="
+fi
 
 if [ "$1" != "--no-engine" ]; then
   echo "========== [1/3] 运行统一评分引擎 =========="
