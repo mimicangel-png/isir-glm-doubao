@@ -19,6 +19,12 @@ def _get_db_path():
         DB_PATH = os.path.join(output_dir, "stock_cache.db")
     return DB_PATH
 
+# ===== 增量K线抓取参数 (2026-09-22新增) =====
+INC_BARS_MAX = 45        # 增量模式单次最多抓取根数(≈1.5个月交易日)
+INC_MIN_BARS = 5         # 增量模式最少抓取根数(覆盖盘中当日快照刷新)
+INC_MAX_GAP_DAYS = 30    # 日历天缺口上限(≈21个交易日), 超过则走全量重抓
+INC_PRICE_TOL = 0.005    # 重叠日收盘价容差(0.5%): 超差视为前复权因子变化 → 全量重抓
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS klines (
     code TEXT NOT NULL, date TEXT NOT NULL,
@@ -93,12 +99,18 @@ class StockDB:
         return f"sh{code}" if code.startswith(("6", "9", "58")) else f"sz{code}"
 
     def get_klines(self, codes, days=130, refresh_today=True):
-        """refresh_today=True: 当日K线即使已缓存也强制重抓(修复盘中快照滞留问题,
+        """refresh_today=True: 当日K线即使已缓存也强制刷新(修复盘中快照滞留问题,
         确保收盘后运行能拿到最终收盘价; 抓取失败时回退用缓存值)
-        (2026-09-16 本地合并: 从本地v3.3移植到远端v3.5基线, 适配盘中三时段自动化)"""
+        (2026-09-16 本地合并: 从本地v3.3移植到远端v3.5基线, 适配盘中三时段自动化)
+
+        2026-09-22 增量改造: 缓存命中时只回补最近 INC_MIN_BARS~INC_BARS_MAX 根
+        (按缺口日历天数动态计算), 不再每轮全量重抓 days 根(512只×300根 → 约1/10流量)。
+        增量数据合并前做"重叠历史日价格一致性校验"(见 _overlap_ok): 不一致说明前复权
+        因子已变化(除权除息)或数据源口径不同, 该只自动降级为全量重抓, 保证序列连续。"""
         today = datetime.now().strftime("%Y-%m-%d")
         all_klines = {}
-        missing = []
+        inc_codes = []    # [(code, pull_bars)] 只回补最近若干根
+        full_codes = []   # 历史不足 / 缺口过大 → 全量抓取
         now = datetime.now()
         wd = now.weekday()
         if wd == 5: latest_td = (now - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -114,22 +126,33 @@ class StockDB:
                 if len(rows) >= days:
                     last_date = rows[-1][0]
                     parsed = [{"date":r[0],"open":r[1],"high":r[2],"low":r[3],"close":r[4],"volume":r[5]} for r in rows]
-                    if last_date >= latest_td:
-                        all_klines[code] = parsed[-days:]
-                        if refresh_today:
-                            # 当日K线可能为盘中快照, 强制重抓以获取最新/收盘价
-                            missing.append(code)
+                    all_klines[code] = parsed[-days:] if last_date >= latest_td else parsed
+                    if last_date >= latest_td and not refresh_today:
+                        continue          # 不要求刷新当日快照 → 缓存即最终版, 无需抓取
+                    gap_days = 0
+                    if last_date < latest_td:
+                        try:
+                            gap_days = (datetime.strptime(latest_td, "%Y-%m-%d")
+                                        - datetime.strptime(last_date, "%Y-%m-%d")).days
+                        except ValueError:
+                            gap_days = INC_MAX_GAP_DAYS + 1
+                    if gap_days <= INC_MAX_GAP_DAYS:
+                        # 增量回补: 日历天 → 交易日约 ×5/7, 再留 INC_MIN_BARS 缓冲, 夹在范围内
+                        need = int(gap_days * 5 / 7) + INC_MIN_BARS
+                        inc_codes.append((code, min(INC_BARS_MAX, max(INC_MIN_BARS, need))))
                     else:
-                        all_klines[code] = parsed
-                        missing.append(code)
+                        full_codes.append(code)
                 elif len(rows) > 0:
                     all_klines[code] = [{"date":r[0],"open":r[1],"high":r[2],"low":r[3],"close":r[4],"volume":r[5]} for r in rows]
-                    missing.append(code)
+                    full_codes.append(code)
                 else:
-                    missing.append(code)
+                    full_codes.append(code)
 
-        if missing:
-            self._fetch_klines_batch(missing, days, today, all_klines)
+        if full_codes:
+            self._fetch_klines_batch(full_codes, days, today, all_klines, incremental=False)
+        if inc_codes:
+            self._fetch_klines_batch([c for c, _ in inc_codes], days, today, all_klines,
+                                     incremental=True, pull_map=dict(inc_codes))
 
         # 2026-09-22: 兜底——仍有标的缺当日bar(新浪盘中无当日数据)时用qt实时快照合成
         if latest_td == today:
@@ -143,11 +166,17 @@ class StockDB:
                 all_klines[code] = all_klines[code][-days:]
         return all_klines
 
-    def _fetch_klines_batch(self, codes, days, today, all_klines):
-        print(f"  [DB] 增量抓取 {len(codes)} 只K线...")
+    def _fetch_klines_batch(self, codes, days, today, all_klines, incremental=False, pull_map=None):
+        """incremental=True: 只抓最近 pull 根(默认 INC_BARS_MAX), 合并前做重叠一致性校验;
+        incremental=False: 全量抓取 days 根(冷启动 / 缺口过大 / 增量校验失败时的兜底)。
+        2026-09-22 增量改造: 原 refresh_today 场景下 512 只全部重抓 300 根, 现按需回补。"""
+        pull_default = INC_BARS_MAX if incremental else days
+        pull_map = pull_map or {}
+        print(f"  [DB] {'增量' if incremental else '全量'}抓取 {len(codes)} 只K线...")
         def fetch_one(code):
+            pull = int(pull_map.get(code) or pull_default)
             sym = self._to_symbol(code)
-            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{days},qfq"
+            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{pull},qfq"
             req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
             try:
                 resp = urllib.request.urlopen(req, timeout=10)
@@ -156,10 +185,10 @@ class StockDB:
                 return code, klines, None, "tencent"
             except Exception as e:
                 # 腾讯失败(如WAF限流501) → 东财前复权通道(含当日bar) → 新浪备用
-                em = self._fetch_em_kline(code, days)
+                em = self._fetch_em_kline(code, pull)
                 if em:
                     return code, em, None, "eastmoney"
-                fb = self._fetch_sina_kline(code, sym, days)
+                fb = self._fetch_sina_kline(code, sym, pull)
                 if fb is not None:
                     return code, fb, None, "sina"
                 return code, None, str(e)[:200], "tencent"
@@ -189,6 +218,13 @@ class StockDB:
                             except (IndexError, ValueError, TypeError):
                                 continue
                     if parsed:
+                        # 2026-09-22: 增量合并前校验重叠历史日价格一致性。不一致说明前复权
+                        # 因子已变化(除权除息)或数据源口径不同, 增量拼接会造成历史断层
+                        # → 立即降级为全量重抓该只
+                        if incremental and not self._overlap_ok(all_klines.get(code, []), parsed, today):
+                            self._log_fetch(code, today, "klines", "inc_mismatch")
+                            self._fetch_klines_batch([code], days, today, all_klines, incremental=False)
+                            continue
                         existing = {r["date"]:r for r in all_klines.get(code,[])}
                         # 2026-09-22: 新浪为不复权口径, 只允许补缺口(不覆盖腾讯/东财前复权数据), 防口径混用
                         if src == "sina":
@@ -207,6 +243,32 @@ class StockDB:
                         self._log_fetch(code, today, "klines", f"ok_{src}")
                 else:
                     self._log_fetch(code, today, "klines", "failed", err)
+
+    def _overlap_ok(self, local, fetched, today=None):
+        """重叠历史日收盘价一致性校验(2026-09-22新增, 增量抓取专用)。
+        返回 True  → 新旧序列同口径连续, 可安全合并;
+        返回 False → 前复权因子已变化(除权除息)或数据源口径不同, 增量拼接会造成历史断层,
+                     调用方必须降级为全量重抓。
+        注意: 当日bar只可能是盘中快照(随行情变动), 不参与校验——否则每次盘中运行都会
+        因价格变动被误判为"口径不一致", 反而退化成全量抓取。"""
+        if not local or not fetched:
+            return False
+        lb = {r["date"]: r for r in local}
+        fb = {r["date"]: r for r in fetched}
+        overlap = sorted(d for d in (set(lb) & set(fb)) if d != today)
+        if not overlap:
+            return False
+        for d in overlap[-3:]:          # 校验最近3个重叠历史日
+            try:
+                lc = float(lb[d].get("close") or 0)
+                fc = float(fb[d].get("close") or 0)
+            except (TypeError, ValueError):
+                return False
+            if lc <= 0 or fc <= 0:
+                return False
+            if abs(lc - fc) / lc > INC_PRICE_TOL:
+                return False
+        return True
 
     def _fetch_em_kline(self, code, days):
         """东财前复权日K备用通道(2026-09-22新增, 优先级高于新浪):
