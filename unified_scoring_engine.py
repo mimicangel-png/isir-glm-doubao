@@ -150,10 +150,12 @@ def fetch_index_klines(days=300):
 
 def calc_market_trend(index_klines):
     """计算市场趋势: 指数收盘 vs 50日均线
-    返回: (trend: 1=多头/-1=空头, ma50, close, label)
+    返回: (trend: 1=多头/-1=空头/0=数据缺失(未知), ma50, close, label)
+    修复(2026-09-22): 数据不足时不再默认多头(等于白送仓位上限), 改为返回 0=未知,
+    调用方按"低置信度"保守处理(仓位上限减半)。
     """
     if not index_klines or len(index_klines) < 50:
-        return 1, 0, 0, "数据不足(默认多头)"
+        return 0, 0, 0, "⚠️上证数据缺失,门控未生效(按未知处理,仓位上限减半,置信度低)"
     closes = [b["close"] for b in index_klines]
     ma50 = sum(closes[-50:]) / 50
     close = closes[-1]
@@ -377,6 +379,11 @@ def compute_global_gate(global_markets):
     pos_adjust = 1.0
     gates = []
 
+    # 修复(2026-09-22): 数据源失败不再静默等同"正常/VIX=0"
+    n_src = len(global_markets)
+    n_unknown = sum(1 for v in global_markets.values() if v.get("gate") == "unknown")
+    data_missing = (n_src == 0) or (n_unknown >= max(1, n_src - 1))
+
     if vix_close > 30:
         level = max(level, 2); pos_adjust = min(pos_adjust, 0.5)
         gates.append(f"VIX={vix_close:.0f}>30 恐慌高位,仓位减半")
@@ -396,7 +403,10 @@ def compute_global_gate(global_markets):
         gates.append(f"道指{dji_ret:+.1f}%<-2%风险偏好下降")
 
     if level == 0:
-        if ndx_ret > 1 and dji_ret > 1:
+        if data_missing:
+            interp = f"⚠️外围数据缺失({n_unknown}/{n_src}源获取失败),门控未生效——按中性处理但置信度低,仓位上限×0.75"
+            pos_adjust = min(pos_adjust, 0.75)
+        elif ndx_ret > 1 and dji_ret > 1:
             interp = f"外围隔夜大涨(纳指{ndx_ret:+.1f}%,道指{dji_ret:+.1f}%),A股今日大概率高开,科技板块偏正面"
         elif ndx_ret > 0 and dji_ret > 0:
             interp = f"外围隔夜小涨(纳指{ndx_ret:+.1f}%,道指{dji_ret:+.1f}%),情绪中性偏正面"
@@ -410,7 +420,10 @@ def compute_global_gate(global_markets):
         interp = f"外围危险: {'; '.join(gates)}. 强烈防御,不开新仓,浮亏果断止损"
 
     vix_note = f"VIX={vix_close:.0f}" + ("(恐慌)" if vix_close > 25 else ("(正常)" if vix_close < 18 else "(偏高)"))
-    label = f"外围门控: {'危险' if level==2 else '警戒' if level==1 else '正常'} | {vix_note}"
+    if data_missing:
+        label = f"外围门控: ⚠️数据缺失({n_unknown}/{n_src}源失败) | 置信度低"
+    else:
+        label = f"外围门控: {'危险' if level==2 else '警戒' if level==1 else '正常'} | {vix_note}"
     return level, pos_adjust, label, interp
 
 # ================================================================
@@ -617,6 +630,8 @@ def compute_all_factors(klines, extra_info, fund_flows, events, sectors):
             "_rsi":rsi_val,"_dif":dif,"_dea":dea,"_vol_ratio":vol_ratio,
             "_cmf":cmf_val,"_main5d":main_flow_5d,"_turnover":turnover_z,
             "_streak_dn":streak_dn,
+            # 修复(2026-09-22): 暴露昨收, 供SS量价方向判断用真实涨跌(原用 close>MA5 近似)
+            "_prev_close":closes[-2] if len(closes)>=2 else close,
         }
 
     # 截面标准化
@@ -670,7 +685,10 @@ def compute_rankings(factor_data):
         amplitude_z = factors.get("amplitude_z",0)
         event_score_raw = factors.get("event_score",0)
         ret_5d = factors.get("ret_5d",0)
-        price_up = close > ma5_v  # 用价格vs MA5近似今日方向(原始用c[-1]>c[-2])
+        prev_close_v = factors.get("_prev_close",0)
+        # 修复(2026-09-22): 原用 close>MA5 近似"今日方向", 会把"今日下跌但仍在MA5上方"误判为上涨;
+        # 改为真实涨跌口径 close > 昨收(与原始 stock-scoring 的 c[-1]>c[-2] 一致)
+        price_up = (close > prev_close_v) if prev_close_v else (close > ma5_v)
 
         # ===== 技术面 (35%) — 6类指标 (原始stock-scoring完整版) =====
         tech_delta = 0
@@ -887,7 +905,9 @@ def compute_rebound_scores(rankings, klines, extra_info):
             "price": price,
             "market": _get_market_name(code),
             "mcap": extra.get("mcap", 0) or 0,
-            "amount": (kl[-1].get("volume",0) or 0) * price,
+            # 修复(2026-09-22): K线volume单位为"手"(100股), 原 amount=volume*price 少算100倍,
+            # 导致超跌反弹的风控流动性评分与流动性门槛严重失真。
+            "amount": (kl[-1].get("volume",0) or 0) * 100 * price,
             "pct": (price / prev_close - 1) * 100 if prev_close > 0 else 0,
             "open": kl[-1].get("open", price),
             "high": kl[-1].get("high", price),
@@ -991,15 +1011,20 @@ def load_signals():
             print(f"  [WARN] 信号历史损坏，重置")
     return []
 
-def update_trades(rankings, extra_info, date_str, market_trend=1, global_pos_adjust=1.0):
+def update_trades(rankings, extra_info, date_str, market_trend=1, global_pos_adjust=1.0, trade_dates=None):
     trades = load_trades()
     signals = load_signals()
     today_signals = {}
     n_total = len(rankings)
     rank_map = {r["code"]: r for r in rankings}
 
+    # 修复(2026-09-22): 同日重复运行去重键 —— 自动化一天跑3-4次, 原实现会把同一标的
+    # 的同日买卖信号重复写入 signal_history, 造成台账重复计数。
+    _seen_sig = {(s.get("date"), s.get("strategy"), s.get("code"), s.get("signal")) for s in signals}
+
     # 综合仓位上限: 上证门控 × 外围门控
-    base_max = MAX_POSITIONS if market_trend >= 0 else MAX_POSITIONS // 2
+    # 修复(2026-09-22): 门控状态 1=多头/0=未知(数据缺失,保守)/-1=空头 → 仅多头给满仓
+    base_max = MAX_POSITIONS if market_trend > 0 else MAX_POSITIONS // 2
     max_positions = max(1, int(base_max * global_pos_adjust))
 
     for strategy in ["isir","glm","doubao"]:
@@ -1013,7 +1038,15 @@ def update_trades(rankings, extra_info, date_str, market_trend=1, global_pos_adj
             code = trade["code"]
             price = extra_info.get(code,{}).get("price",0)
             current_ret = round((price/trade["entry_price"]-1)*100,2) if price > 0 else 0
-            trade["hold_days"] += 1
+            # 修复(2026-09-22): 原为无条件 hold_days+=1, 自动化同日运行3-4次会把10个
+            # 交易日周期压缩到约3个自然日。改为按交易日计数(entry_date 之后的交易日数),
+            # 同一自然日重复运行不再累加, 且历史被高估的持仓数值会被自动纠正。
+            if trade_dates:
+                trade["hold_days"] = sum(1 for d in trade_dates
+                                         if trade.get("entry_date","") < d <= date_str)
+            elif trade.get("hold_days_date") != date_str:
+                trade["hold_days"] = trade.get("hold_days",0) + 1
+            trade["hold_days_date"] = date_str
             trade["current_price"] = price
             trade["current_return"] = current_ret
 
@@ -1044,14 +1077,16 @@ def update_trades(rankings, extra_info, date_str, market_trend=1, global_pos_adj
                 trades[strategy]["total_count"] += 1
                 if current_ret > 0: trades[strategy]["win_count"] += 1
                 today_signals[strategy][code] = "sell"
-                signals.append({
-                    "date": date_str, "strategy": strategy, "code": code,
-                    "name": trade.get("name",""), "signal": "sell",
-                    "price": price, "rank": current_rank,
-                    "return_pct": current_ret, "entry_date": trade.get("entry_date",""),
-                    "entry_price": trade.get("entry_price",0),
-                    "reason": exit_reason
-                })
+                if (date_str, strategy, code, "sell") not in _seen_sig:
+                    _seen_sig.add((date_str, strategy, code, "sell"))
+                    signals.append({
+                        "date": date_str, "strategy": strategy, "code": code,
+                        "name": trade.get("name",""), "signal": "sell",
+                        "price": price, "rank": current_rank,
+                        "return_pct": current_ret, "entry_date": trade.get("entry_date",""),
+                        "entry_price": trade.get("entry_price",0),
+                        "reason": exit_reason
+                    })
             elif code in current_top:
                 still_open.append(trade)
                 today_signals[strategy][code] = "hold"
@@ -1082,12 +1117,14 @@ def update_trades(rankings, extra_info, date_str, market_trend=1, global_pos_adj
                         "hold_days":0,"current_price":price,"current_return":0,"status":"open"
                     })
                 today_signals[strategy][code] = "buy"
-                signals.append({
-                    "date": date_str, "strategy": strategy, "code": code,
-                    "name": name, "signal": "buy",
-                    "price": price, "rank": current_top_info[code][rank_key],
-                    "return_pct": 0, "entry_date": date_str, "entry_price": price
-                })
+                if (date_str, strategy, code, "buy") not in _seen_sig:
+                    _seen_sig.add((date_str, strategy, code, "buy"))
+                    signals.append({
+                        "date": date_str, "strategy": strategy, "code": code,
+                        "name": name, "signal": "buy",
+                        "price": price, "rank": current_top_info[code][rank_key],
+                        "return_pct": 0, "entry_date": date_str, "entry_price": price
+                    })
 
         trades[strategy]["open"] = still_open
 
@@ -1459,11 +1496,11 @@ def _build_market_overview(mkt, rankings, extra_info, n_consensus, n_total, top_
     </div>
 
     <!-- 市场趋势门控 -->
-    <div class="mo-card" style="{"border-color:#dc2626" if mkt.get("market_trend",{}).get("trend",1) < 0 else ""}">
+    <div class="mo-card" style="{"border-color:#dc2626" if mkt.get("market_trend",{}).get("trend",1) < 0 else ("border-color:#f59e0b" if mkt.get("market_trend",{}).get("trend",1) == 0 else "")}">
       <div class="mo-title">市场趋势门控</div>
-      <div class="mo-big" style="color:{"#dc2626" if mkt.get("market_trend",{}).get("trend",1) < 0 else "#16a34a"}">{"空头" if mkt.get("market_trend",{}).get("trend",1) < 0 else "多头"}</div>
+      <div class="mo-big" style="color:{"#dc2626" if mkt.get("market_trend",{}).get("trend",1) < 0 else ("#f59e0b" if mkt.get("market_trend",{}).get("trend",1) == 0 else "#16a34a")}">{"空头" if mkt.get("market_trend",{}).get("trend",1) < 0 else ("门控未知" if mkt.get("market_trend",{}).get("trend",1) == 0 else "多头")}</div>
       <div class="mo-sub">{mkt.get("market_trend",{}).get("label","-")}</div>
-      <div style="margin-top:6px;font-size:11px;color:{"#dc2626" if mkt.get("market_trend",{}).get("trend",1) < 0 else "var(--text-secondary)"}">{"仓位上限减半→15只, 浮亏强制减仓" if mkt.get("market_trend",{}).get("trend",1) < 0 else "仓位上限30只, 正常操作"}</div>
+      <div style="margin-top:6px;font-size:11px;color:{"#dc2626" if mkt.get("market_trend",{}).get("trend",1) < 0 else ("#f59e0b" if mkt.get("market_trend",{}).get("trend",1) == 0 else "var(--text-secondary)")}">{"仓位上限减半→15只, 浮亏强制减仓" if mkt.get("market_trend",{}).get("trend",1) < 0 else ("⚠️数据缺失,保守减半→15只(置信度低)" if mkt.get("market_trend",{}).get("trend",1) == 0 else "仓位上限30只, 正常操作")}</div>
     </div>
 
     <!-- 外围市场门控 -->
@@ -2183,7 +2220,12 @@ def main():
     klines = db.get_klines(codes, days=300)
     extra_info = db.get_extra_info(codes, force_refresh=True)
     fund_flows = db.get_fund_flows(codes)
-    print(f"  K线:{len(klines)} | 行情:{len(extra_info)} | 资金流:{len(fund_flows)}")
+    # 交易日历(池内K线日期并集), 用于持仓天数按交易日计数
+    trade_dates = sorted({bar["date"] for bars in klines.values() for bar in bars})
+    _today_str = datetime.now().strftime("%Y-%m-%d")
+    n_stale_flow = sum(1 for v in fund_flows.values() if v.get("stale"))
+    flow_note = f" (⚠️非今日口径{n_stale_flow}只)" if n_stale_flow else " (当日实时口径✅)"
+    print(f"  K线:{len(klines)} | 行情:{len(extra_info)} | 资金流:{len(fund_flows)}{flow_note}")
 
     print(f"\n  [2/4] 计算33因子 + 三套排名...")
     sectors = {code: sector_map.get_sector(code) for code in codes}
@@ -2241,6 +2283,8 @@ def main():
     print(f"  上证综指: {mkt_idx_close} | MA50: {mkt_ma50} | {mkt_trend_label}")
     if mkt_trend < 0:
         print(f"  ⚠️ 空头市场: 仓位上限 {MAX_POSITIONS}→{MAX_POSITIONS//2}, 浮亏持仓强制减仓")
+    elif mkt_trend == 0:
+        print(f"  ⚠️ 上证门控数据缺失: 按'未知'保守处理, 仓位上限 {MAX_POSITIONS}→{MAX_POSITIONS//2} (置信度低)")
 
     # 外围市场门控
     print(f"\n  [外围市场门控] 获取美股隔夜数据...")
@@ -2252,14 +2296,15 @@ def main():
     print(f"  → {global_label}")
     print(f"  → {global_interp}")
     # 综合仓位上限 (上证门控 × 外围门控)
-    effective_max = int(MAX_POSITIONS * (0.5 if mkt_trend < 0 else 1.0) * global_pos_adj)
+    # 修复(2026-09-22): mkt_trend==0(数据缺失/未知) 同样按保守口径减半, 不再默认满仓
+    effective_max = int(MAX_POSITIONS * (0.5 if mkt_trend <= 0 else 1.0) * global_pos_adj)
     if effective_max < MAX_POSITIONS:
         print(f"  ⚠️ 综合仓位上限: {MAX_POSITIONS}→{effective_max}")
 
     print(f"\n  [3/4] 信号追踪 + 交易更新...")
     date_str = datetime.now().strftime("%Y-%m-%d")
     history = save_history(rankings, extra_info, date_str)
-    trades, today_signals, signal_history = update_trades(rankings, extra_info, date_str, market_trend=mkt_trend, global_pos_adjust=global_pos_adj)
+    trades, today_signals, signal_history = update_trades(rankings, extra_info, date_str, market_trend=mkt_trend, global_pos_adjust=global_pos_adj, trade_dates=trade_dates)
 
     for strat in ["isir","glm","doubao"]:
         t = trades[strat]

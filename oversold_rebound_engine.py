@@ -134,7 +134,8 @@ def fetch_pool_stocks():
             market = "深主板"
         all_stocks.append({
             "code": code, "name": name, "price": price,
-            "pct": pct, "amount": today_k.get("volume", 0) * price,
+            # 修复(2026-09-22): volume单位为"手"(100股), 原少算100倍 → 流动性风控评分失真
+            "pct": pct, "amount": today_k.get("volume", 0) * 100 * price,
             "high": today_k.get("high", price), "low": today_k.get("low", price),
             "open": today_k.get("open", price), "prev_close": prev_close,
             "pe": info.get("pe_ttm", 0), "pb": info.get("pb", 0),

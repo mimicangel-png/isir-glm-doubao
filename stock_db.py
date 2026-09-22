@@ -369,11 +369,16 @@ class StockDB:
                 # 修复(2026-09-14): 资金流数据源改为通达信MCP定时任务写入(收盘后16:35),
                 # 数据可能滞后当日(盘前读到的是昨日完整数据)。取≤today的最近记录而非严格等于today,
                 # 避免tdx完整5/20日数据(写在上一个交易日)被错过。
+                # 修复(2026-09-22): 回调带出记录自身的 date 并标记 stale, 使调用方能够区分
+                # "今日实时口径"与"昨日口径", 避免旧数据静默进入当日评分。
                 row = conn.execute(
-                    "SELECT main_net_5d,main_net_20d,inflow_rate,jumbo_net,main_net_today FROM fund_flows "
+                    "SELECT main_net_5d,main_net_20d,inflow_rate,jumbo_net,main_net_today,date FROM fund_flows "
                     "WHERE code=? AND date<=? ORDER BY date DESC LIMIT 1",
                     (code, today)).fetchone()
-                if row: result[code] = dict(zip(["main_net_5d","main_net_20d","inflow_rate","jumbo_net","main_net_today"], row))
+                if row:
+                    rec = dict(zip(["main_net_5d","main_net_20d","inflow_rate","jumbo_net","main_net_today","date"], row))
+                    rec["stale"] = (rec.get("date") != today)
+                    result[code] = rec
                 else: need_fetch.append(code)
         if need_fetch:
             fetched = self._fetch_fund_flows_batch(need_fetch, today)

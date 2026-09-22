@@ -176,6 +176,9 @@ def main():
             "main_net_20d": sum(main_hist[-20:]),
             "jumbo_net": last[5],
             "inflow_rate": 0.0,
+            # 修复(2026-09-22): 记录数据自身日期。原实现无论末行是否为今日, 都按 today_str 写库,
+            # 会把昨日数据冒充当日数据(5D/20D 也随之错位)。现在按真实日期落库。
+            "data_date": last[0],
         }
         if last[0] == today_str:
             realtime_n += 1
@@ -186,10 +189,12 @@ def main():
 
     with sqlite3.connect(DB_PATH) as conn:
         for code, r in records.items():
+            # 修复(2026-09-22): 落库日期 = 数据自身日期(非抓取日), fetch_log 仍记抓取日
+            data_date = r.get("data_date") or today_str
             conn.execute(
                 "INSERT OR REPLACE INTO fund_flows(code,date,main_net_5d,main_net_20d,inflow_rate,jumbo_net,main_net_today,fetched_at) "
                 "VALUES(?,?,?,?,?,?,?,datetime('now'))",
-                (code, today_str, r["main_net_5d"], r["main_net_20d"],
+                (code, data_date, r["main_net_5d"], r["main_net_20d"],
                  r["inflow_rate"], r["jumbo_net"], r["main_net_today"]),
             )
             conn.execute(
@@ -198,7 +203,7 @@ def main():
                 (code, today_str, "fund_flow_eastmoney"),
             )
 
-    print(f"✅ 东财push2资金流入库完成: {len(records)}只, 其中含今日实时{realtime_n}只")
+    print(f"✅ 东财push2资金流入库完成: {len(records)}只 | 含今日实时{realtime_n}只" + (f" | ⚠️{len(records)-realtime_n}只按数据实际日期回填(非今日)" if len(records) > realtime_n else ""))
     rows = sorted(records.items(), key=lambda kv: -kv[1]["main_net_5d"])
     for c, r in rows[:3]:
         print(f"  5日净流入TOP {c}: 今日{r['main_net_today']/1e8:+.2f}亿 5日{r['main_net_5d']/1e8:+.2f}亿 20日{r['main_net_20d']/1e8:+.2f}亿")
