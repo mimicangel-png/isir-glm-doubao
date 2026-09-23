@@ -2,19 +2,6 @@
   {
     "date": "2026-09-17",
     "strategy": "glm",
-    "code": "603083",
-    "name": "剑桥科技",
-    "signal": "sell",
-    "price": 220.22,
-    "rank": 23,
-    "return_pct": -0.07,
-    "entry_date": "2026-09-16",
-    "entry_price": 220.38,
-    "reason": "空头减仓(-0.1%)"
-  },
-  {
-    "date": "2026-09-17",
-    "strategy": "glm",
     "code": "600176",
     "name": "中国巨石",
     "signal": "sell",
@@ -6226,5 +6213,17 @@
     "entry_date": "2026-09-22",
     "entry_price": 196.24,
     "reason": "排名崩溃(#313)"
+  },
+  {
+    "date": "2026-09-23",
+    "strategy": "doubao",
+    "code": "301122",
+    "name": "采纳股份",
+    "signal": "buy",
+    "price": 61.3,
+    "rank": 1,
+    "return_pct": 0,
+    "entry_date": "2026-09-23",
+    "entry_price": 61.3
   }
 ]
